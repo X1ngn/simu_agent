@@ -1,0 +1,28 @@
+# core
+langgraph
+langchain-core
+typing_extensions
+grandalf
+
+
+# schema & config
+pydantic>=2.0
+python-dotenv
+
+# analysis
+pandas
+pyyaml
+
+# llm (choose based on backend)
+langchain-openai
+langchain-ollama
+langchain-community
+
+# engineering enhancements
+jsonpatch
+tenacity
+rich
+
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.8.2

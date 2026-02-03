@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent App</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 12px; }
+    #log { border: 1px solid #ddd; border-radius: 8px; padding: 12px; min-height: 260px; white-space: pre-wrap; }
+    .row { display: flex; gap: 8px; margin-top: 10px; }
+    input { flex: 1; padding: 10px; border: 1px solid #ccc; border-radius: 8px; }
+    button { padding: 10px 12px; border-radius: 8px; border: 1px solid #ccc; background: #fafafa; cursor: pointer; }
+    button:hover { background: #f0f0f0; }
+    .meta { color: #666; font-size: 12px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h2>Agent App (FastAPI 后端)</h2>
+
+  <div id="log"></div>
+  <div class="meta">session_id: <span id="sid">(none)</span></div>
+
+  <div class="row">
+    <input id="q" placeholder="输入消息..." />
+  </div>
+
+  <div class="row">
+    <button id="send">非流式</button>
+    <button id="stream">流式</button>
+    <button id="stop">停止</button>
+    <button id="clear">清空</button>
+  </div>
+
+<script>
+  const API_BASE = "http://127.0.0.1:8000";
+  let sessionId = null;
+  let aborter = null;
+
+  const logEl = document.getElementById("log");
+  const sidEl = document.getElementById("sid");
+  const qEl = document.getElementById("q");
+
+  function append(text) {
+    logEl.textContent += text;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setSid(sid) {
+    sessionId = sid;
+    sidEl.textContent = sid || "(none)";
+  }
+
+  function pretty(obj) {
+    try {
+      return JSON.stringify(obj, null, 2);
+    } catch {
+      return String(obj);
+    }
+  }
+
+  async function sendOnce() {
+    const msg = qEl.value.trim();
+    if (!msg) return;
+
+    append(`\n\nUser: ${msg}\nAssistant:\n`);
+
+    const resp = await fetch(`${API_BASE}/api/chat`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        session_id: sessionId,
+        message: msg,
+        debug: true,
+        max_retries: 1
+      })
+    });
+
+    if (!resp.ok) {
+      append(`(HTTP ${resp.status})`);
+      return;
+    }
+
+    const data = await resp.json();
+    setSid(data.session_id);
+
+    // ✅ 后端返回的是 report，不是 reply
+    append(pretty(data.report));
+
+    qEl.value = "";
+  }
+
+  function stopStream() {
+    if (aborter) aborter.abort();
+  }
+
+  async function streamSend() {
+    const msg = qEl.value.trim();
+    if (!msg) return;
+
+    stopStream();
+    aborter = new AbortController();
+
+    append(`\n\nUser: ${msg}\nAssistant:\n`);
+
+    const resp = await fetch(`${API_BASE}/api/chat/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: aborter.signal,
+      body: JSON.stringify({
+        session_id: sessionId,
+        message: msg,
+        debug: true,
+        max_retries: 1
+      })
+    });
+
+    if (!resp.ok || !resp.body) {
+      append(`(HTTP ${resp.status})`);
+      aborter = null;
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+
+    // SSE buffer：以 \n\n 分隔一个事件
+    let buffer = "";
+
+    function handleSseEvent(eventName, dataStr) {
+      let data;
+      try { data = JSON.parse(dataStr); } catch { data = { raw: dataStr }; }
+
+      if (eventName === "meta") {
+        if (data.session_id) setSid(data.session_id);
+        return;
+      }
+
+      if (eventName === "delta") {
+        // 你后端现在 delta 只是发 {status:"started"}，这里做个提示
+        if (data.status) append(`[${data.status}]\n`);
+        if (data.delta) append(data.delta); // 未来如果你实现 token streaming，会走这条
+        return;
+      }
+
+      if (eventName === "done") {
+        // ✅ 后端 done 发的是 { report: ... }
+        if (data.report) append(pretty(data.report));
+        return;
+      }
+
+      if (eventName === "error") {
+        append(`\n(错误：${data.error || "unknown"})`);
+        return;
+      }
+    }
+
+    function parseBuffer() {
+      while (true) {
+        const sep = buffer.indexOf("\n\n");
+        if (sep === -1) break;
+
+        const rawMsg = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+
+        let eventName = "message";
+        let dataLines = [];
+
+        const lines = rawMsg.split("\n");
+        for (const line of lines) {
+          if (line.startsWith("event:")) {
+            eventName = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            dataLines.push(line.slice(5).trim());
+          }
+        }
+
+        const dataStr = dataLines.join("\n");
+        if (dataStr) handleSseEvent(eventName, dataStr);
+      }
+    }
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        parseBuffer();
+      }
+    } catch (e) {
+      if (e.name === "AbortError") {
+        append("\n(已停止)");
+      } else {
+        append(`\n(流式异常：${e.message})`);
+      }
+    } finally {
+      qEl.value = "";
+      aborter = null;
+    }
+  }
+
+  function clearAll() {
+    logEl.textContent = "";
+  }
+
+  document.getElementById("send").onclick = sendOnce;
+  document.getElementById("stream").onclick = streamSend;
+  document.getElementById("stop").onclick = stopStream;
+  document.getElementById("clear").onclick = clearAll;
+
+  qEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendOnce();
+    }
+  });
+</script>
+</body>
+</html>

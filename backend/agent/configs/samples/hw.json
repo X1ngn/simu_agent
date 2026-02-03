@@ -1,0 +1,22 @@
+{
+  "cube": [
+    {"float8": 432},
+    {"float16": 108},
+    {"float32": 54},
+    {"float64": 27}
+  ],
+  "vector": [
+    {"float8": 864},
+    {"float16": 216},
+    {"float32": 108},
+    {"float64": 54}
+  ],
+  "mem0": {"capacity_gb": 0.9, "bandwidth_gbps": 5120},
+  "mem1": {"capacity_gb": 64, "bandwidth_gbps": 512},
+  "mem2": {"capacity_gb": 256, "bandwidth_gbps": 51.2},
+  "network": [
+    {"latency_us": 0.5, "size": 8, "bandwidth_gbps": 700},
+    {"latency_us": 2, "size": 64, "bandwidth_gbps": 200},
+    {"latency_us": 10, "size": 1024, "bandwidth_gbps": 50}
+  ]
+}

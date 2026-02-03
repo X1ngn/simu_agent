@@ -1,0 +1,11 @@
+{
+  "proc_num": 16,
+  "tp_size": 2,
+  "pp_size": 2,
+  "dp_size": 2,
+  "cp_size": 2,
+  "ep_size": 2,
+  "gbs": 480,
+  "mbs": 1,
+  "dualpipe": true
+}

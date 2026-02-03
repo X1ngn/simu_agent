@@ -1,0 +1,30 @@
+llm_providers:
+  openai_default:
+    kind: openai
+    model: qwen-max
+    temperature: 0.2
+    max_tokens: 1024
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+  ollama_local:
+    kind: ollama
+    model: qwen2.5:14b
+    temperature: 0.3
+
+  vllm_openai_server:
+    kind: openai_compatible
+    base_url: "http://127.0.0.1:8000/v1"
+    model: "Qwen2.5-32B-Instruct"
+    temperature: 0.2
+    max_tokens: 1024
+
+  vllm_community:
+    kind: vllm_community
+    model: "Qwen2.5-32B-Instruct"
+    # vLLM community wrapper 常用参数（按你机器情况改）
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.90
+    max_new_tokens: 1024
+    temperature: 0.2
+
+

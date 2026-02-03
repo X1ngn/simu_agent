@@ -1,0 +1,24 @@
+agents:
+  analyst:
+    provider_ref: openai_default
+    system_prompt: |
+      你是严谨的分析型助手。输出结构化要点、假设、推导过程，并给出可执行结论。
+    response_style:
+      format: "markdown"
+      verbosity: "medium"
+
+  designer:
+    provider_ref: openai_default
+    system_prompt: |
+      你是产品与交互设计助手。优先给出信息架构、交互流、组件拆分与可落地的UI文案。
+    response_style:
+      format: "markdown"
+      verbosity: "high"
+
+  exam_worker:
+    provider_ref: openai_default
+    system_prompt: |
+      你是刷题与阅卷助手。严格按题目要求作答，分点给出步骤、最终答案与检查点。
+    response_style:
+      format: "markdown"
+      verbosity: "low"
