@@ -63,6 +63,7 @@ class GlobalState(TypedDict, total=False):
     run_id: str
 
     # designer output
+    experiments_plan: List[ExperimentSpec]
     experiments: List[ExperimentSpec]
 
     # exam aggregation (map-reduce)

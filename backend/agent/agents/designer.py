@@ -216,6 +216,10 @@ def designer_agent(state: GlobalState):
     1) 设计实验（plan-and-solve + react）
     2) 动态派发 N 个 exam_worker 并发执行
     3) 收敛结果，决定：失败则分析&可能重试；成功则进入 analyst
+
+    HITL 改造（最小侵入）：
+    - init/design：只生成 experiments -> stage=need_human（不立刻 Send）
+    - dispatch_ready：人类确认后才真正 Send 分发 -> stage=dispatch
     """
     debug = bool(state.get("debug", False))
 
@@ -225,7 +229,9 @@ def designer_agent(state: GlobalState):
 
     _dbg(debug, f"[designer] enter stage={stage}, retries={retries}/{max_retries}")
 
-    # stage: init/design -> produce experiments and dispatch
+    # ------------------------------------------------------------------
+    # (1) init/design：生成实验，但先交给人审（不分发）
+    # ------------------------------------------------------------------
     if stage in ("init", "design"):
         run_id = state.get("run_id") or _make_run_id()
         user_intent = state.get("user_intent", "").strip()
@@ -233,6 +239,30 @@ def designer_agent(state: GlobalState):
             raise ValueError("user_intent invalid")
 
         experiments = gen_experiments(user_intent, run_id, debug)
+
+        _dbg(debug, f"[designer] planned {len(experiments)} experiments; wait human review")
+
+        # ✅ 最小改动：不再 Send，改为进入 need_human
+        # 字段名 experiments_plan 提供给 human_review 节点展示/编辑
+        return {
+            "stage": "need_human",
+            "run_id": run_id,
+            "user_intent": user_intent,
+            "experiments_plan": experiments,
+        }
+
+    # ------------------------------------------------------------------
+    # (2) dispatch_ready：人类确认后，才执行你原本的 Send 分发逻辑
+    # ------------------------------------------------------------------
+    if stage == "dispatch_ready":
+        run_id = state.get("run_id") or _make_run_id()
+        user_intent = state.get("user_intent", "").strip()
+        if not user_intent:
+            raise ValueError("user_intent invalid")
+
+        experiments = state.get("experiments") or state.get("experiments_plan") or []
+        if not isinstance(experiments, list) or not experiments:
+            raise ValueError("experiments invalid: nothing to dispatch")
 
         # LANGGRAPH_ADJUST_HERE:
         # 返回 Send 列表以动态创建 N 个 exam_worker 并发任务
@@ -251,16 +281,16 @@ def designer_agent(state: GlobalState):
                 )
             )
 
-        _dbg(debug, f"[designer] dispatch {len(sends)} exam_worker jobs")
+        _dbg(debug, f"[designer] dispatch {len(sends)} exam_worker jobs (human approved)")
 
         from langgraph.types import Command, Send  # 放到文件顶部或函数内部都可以
 
         return Command(
             update={
-                "stage": "dispatch",
+                "stage": "collect",
                 "run_id": run_id,
                 "user_intent": user_intent,
-                "experiments": experiments,
+                "experiments": experiments,  # ✅ 固化已批准的 experiments
                 "pending": len(experiments),
                 "exam_results": [],
                 "failed_results": [],
@@ -270,7 +300,7 @@ def designer_agent(state: GlobalState):
         )
 
     # stage: collect -> aggregate results and decide next
-    if stage in ("dispatch", "collect"):
+    if stage == "collect":
         pending = int(state.get("pending", 0) or 0)
         results = state.get("exam_results", []) or []
         _dbg(debug, f"[designer] fan-in pending={pending} results_len={len(results)}")
@@ -353,6 +383,7 @@ def designer_agent(state: GlobalState):
 
     # stage: need_redesign -> 在这里你可以实现更复杂的“向用户追问/重新规划”
     if stage == "need_redesign":
+        # TODO：待实现真正的整合错误信息、向用户追问、重新规划功能，当前逻辑直接返回
         return {
             "stage": "done",
             "analyst_report": {
