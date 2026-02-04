@@ -23,6 +23,15 @@ class HitlDecision:
     # edit 模式下：用户输入的“修改后的字符串”（当前版本直接当 user_intent 或交给解析器）
     edited_text: Optional[str] = None
 
+def _safe_get_experiments_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    # payload 可能是 {"experiments_plan": ...} 或 {"value": {...}}
+    if "experiments_plan" in payload and isinstance(payload["experiments_plan"], dict):
+        return payload["experiments_plan"]
+    v = payload.get("value")
+    if isinstance(v, dict) and "experiments_plan" in v and isinstance(v["experiments_plan"], dict):
+        return v["experiments_plan"]
+    return {}
+
 
 def _extract_interrupt_payload(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
@@ -115,11 +124,7 @@ def handle_hitl_interrupts(
             # 当前版本：用户输入一段字符串 -> 后台“先当作新的 user_intent”
             # 你后续可以在这里接解析器：把 edited_text 解析成 experiments结构
             edited_text = (decision.edited_text or "").strip()
-
-            experiments = {}
-            intr = payload.get("value")
-            if intr:
-                experiments = intr.value.get("experiments_plan")
+            experiments = _safe_get_experiments_from_payload(payload)
 
             if edited_text:
                 # 写回 state，触发重新设计
@@ -170,7 +175,7 @@ def main():
 
     print("\n=== FINAL REPORT ===")
     report = final_state.get("analyst_report", {}) or {}
-    if not report and final_state.get("hitl_status") == "rejected":
+    if not report:
         # 拒绝时给一个最小可读输出（不影响你原 report 打印结构）
         print("ok: False")
         print("message: user rejected the experiment design; run aborted")

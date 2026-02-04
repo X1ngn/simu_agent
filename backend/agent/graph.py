@@ -54,26 +54,34 @@ def _route_after_analyst(state: GlobalState) -> str:
 
 
 
-def build_graph():
+# backend/agent/graph.py
+
+from typing import Callable, Any, Optional
+from langgraph.checkpoint.base import BaseCheckpointSaver
+
+def build_graph(
+    designer=designer_agent,
+    human_review=human_review_node,
+    worker=exam_worker,
+    analyst=analyst_agent,
+    checkpointer: Optional[BaseCheckpointSaver] = None,
+):
     g = StateGraph(GlobalState)
 
-    g.add_node("designer", designer_agent)
-    g.add_node("human_review", human_review_node)
-    g.add_node("exam_worker", exam_worker)
-    g.add_node("analyst", analyst_agent)
+    g.add_node("designer", designer)
+    g.add_node("human_review", human_review)
+    g.add_node("exam_worker", worker)
+    g.add_node("analyst", analyst)
 
-    # fan-in：worker 完成后回 designer 聚合结果
     g.add_edge("exam_worker", "designer")
-
-    # 人审后回 designer（批准 -> dispatch；不批准 -> redesign）
     g.add_edge("human_review", "designer")
 
     g.set_entry_point("designer")
-
     g.add_conditional_edges("designer", _route_after_designer)
     g.add_conditional_edges("analyst", _route_after_analyst)
 
-    checkpointer = MemorySaver()
-    graph = g.compile(checkpointer=checkpointer, interrupt_before=None)
+    if checkpointer is None:
+        checkpointer = MemorySaver()
 
-    return graph
+    return g.compile(checkpointer=checkpointer, interrupt_before=None)
+

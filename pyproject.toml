@@ -1,0 +1,10 @@
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-q -ra"
+testpaths = ["tests", "."]
+pythonpath = ["backend/agent", "."]
+
+markers = [
+  "unit: pure function tests",
+  "integration: graph-level tests with fakes",
+]
