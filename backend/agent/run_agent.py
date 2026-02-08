@@ -9,6 +9,7 @@ from graph import build_graph
 
 from langgraph.types import Command
 
+from backend.agent.memory import Mem0MilvusMemoryStore
 
 # =========================
 # HITL 高内聚处理模块
@@ -164,8 +165,15 @@ def main():
         "max_retries": 1,
     }
 
+    mem_store = Mem0MilvusMemoryStore()
+
     # thread_id 用于 checkpoint / 多会话并行
-    config = {"configurable": {"thread_id": "demo_thread"}}
+    config = {
+        "configurable": {
+            "thread_id": "demo_thread",
+            "mem_store": mem_store
+        }
+    }
 
     # 1) 先正常 invoke 一次（保持你原有逻辑）
     final_state = app.invoke(init_state, config=config)

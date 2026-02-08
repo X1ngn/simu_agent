@@ -1,48 +1,62 @@
+from typing import Any, Dict, Optional
 
-
-from typing import Any, Dict
-from backend.agent.state import GlobalState
 from langgraph.types import interrupt
+from langchain_core.runnables import RunnableConfig
 
-def human_review_node(state: GlobalState) -> Dict[str, Any]:
+from backend.agent.memory import _get_mem_store
+from backend.agent.state import GlobalState
+
+
+def human_review_node(state: GlobalState, config: RunnableConfig) -> Dict[str, Any]:
     """
-    人在回路节点：
-    - 暂停图执行，把 designer 的“待分发方案”交给人类确认/修改
-    - 人类批准后：把 stage 置为 dispatch，回到 designer 让其 Send 分发 worker
-    - 人类不批准：把 stage 置为 need_redesign，回到 designer 重新设计
+    HITL：人类确认/修改/拒绝实验设计
+    - accept/edit/reject 时写入 mem0 记忆（best-effort）
     """
-    # 你可以把这里的字段名改成你 GlobalState / designer_agent 实际产出的字段
     review_payload = {
         "title": "Human Review Required",
         "stage": state.get("stage"),
         "experiments_plan": state.get("experiments_plan"),
-        "note": "请返回 {action: str, feedback: str, experiment: ...,}",
+        "note": "请返回 {action: str, feedback: str, experiments: ...}；edit 时 experiments 为你修改后的正确结果",
     }
 
-    # interrupt 会让图暂停；resume 时，interrupt() 会“返回”你传入的 resume 数据
     resp = interrupt(review_payload) or {}
 
     action = resp.get("action")
-    feedback = resp.get("feedback")
+    feedback = resp.get("feedback") or ""
 
     updates: Dict[str, Any] = {}
 
-    # 人类可以直接改 plan / dispatch_spec（按需）
     if "experiments" in resp:
         updates["experiments"] = resp["experiments"]
-    if feedback is not None:
-        updates["human_feedback"] = feedback
+    updates["human_feedback"] = feedback
 
     if not action:
-        raise "Invalid human action"
+        raise ValueError("Invalid human action")
 
-    if action == "accept" or action == "edit":
-        # ✅ 批准后回到 designer，让 designer 在 dispatch 阶段真正执行 Send 分发
-        # TODO：edit时记录正负样本
+    # --- write memory (DI from config) ---
+    store = _get_mem_store(config)
+    if store is None:
+        # 这里建议直接 raise，避免“以为写了其实没写”
+        raise RuntimeError("mem_store missing in RunnableConfig.configurable.mem_store")
+
+    try:
+        store.record_from_human_review(
+            state=dict(state),
+            action=str(action),
+            human_feedback=str(feedback),
+            experiments_plan=state.get("experiments_plan"),
+            experiments=resp.get("experiments"),
+        )
+    except Exception as e:
+        if bool(state.get("debug", False)):
+            print(f"[human_review][mem0] write failed: {e}")
+
+    # --- stage transition ---
+    if action in ("accept", "edit"):
         updates["stage"] = "dispatch_ready"
+    elif action == "reject":
+        updates["stage"] = "done"
     else:
-        # ❌ 不批准则直接推出
-        # TODO：记录负样本
         updates["stage"] = "done"
 
     return updates

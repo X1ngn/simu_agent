@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List
 
+from langchain_core.runnables import RunnableConfig
+
 from backend.agent.state import ExamResult, ExperimentSpec, GlobalState
 from backend.agent.tools.json_io import read_json, write_json, apply_dotpatch
 from backend.agent.tools.sim_engine import run_simulation, SimulationError
@@ -16,7 +18,7 @@ def _dbg(debug: bool, msg: str) -> None:
         print(msg)
 
 
-def exam_worker(state: GlobalState) -> Dict[str, Any]:
+def exam_worker(state: GlobalState, config: RunnableConfig) -> Dict[str, Any]:
     """
     单个 exam_agent worker 节点逻辑（ReAct 范式：读样例 -> 修改 -> 写文件 -> 调引擎 -> 返回结果）
     约定：由 designer 派发时在 state 里带入一个临时字段 current_experiment

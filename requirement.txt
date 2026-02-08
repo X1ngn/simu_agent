@@ -26,3 +26,7 @@ rich
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 pydantic==2.8.2
+
+#memory
+mem0ai
+pymilvus

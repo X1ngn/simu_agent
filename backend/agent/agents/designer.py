@@ -12,11 +12,12 @@ from typing import Any, Dict, List
 
 from backend.agent.tools.json_io import read_json
 
-from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
 
 from backend.agent.llm_factory import get_llm_for_agent
 from backend.agent.prompts.designer import designer_prompt
+from backend.agent.memory import _get_mem_store
 
 
 def _dbg(debug: bool, msg: str) -> None:
@@ -28,47 +29,42 @@ def _make_run_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
-def gen_experiments(user_intent: str, run_id: str, debug: bool) -> List[ExperimentSpec]:
+def gen_experiments(
+    user_intent: str,
+    run_id: str,
+    debug: bool,
+    memories: List[Dict[str, Any]] | None = None,
+) -> List[ExperimentSpec]:
     """
     使用 LLM 根据 user_intent 生成实验设计（List[ExperimentSpec]）。
-    - LLM 只产生“实验规格”，本地负责 out_dir/run_id 等工程字段收口。
-    - 输出必须是严格 JSON；解析失败/校验失败则 fallback 到默认 sweep。
+    - memories：由外部检索得到的历史记忆（accept/edit/reject），用于给 LLM 提示避免重复错误。
     """
     base_out = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "data", "runs", run_id)
     )
 
-    # ---- fallback（保留你原来的默认策略）----
     def _fallback_default() -> List[ExperimentSpec]:
-        gbs_list = [64, 128, 256, 512, 1024]
-        exps: List[ExperimentSpec] = []
-        for i, gbs in enumerate(gbs_list, start=1):
-            exp_id = f"exp_{i:02d}_gbs_{gbs}"
-            out_dir = os.path.join(base_out, exp_id)
-            exps.append(
-                {
-                    "exp_id": exp_id,
-                    "description": f"Sweep global_batch_size={gbs}",
-                    "model_patch": {},
-                    "run_patch": {"train.global_batch_size": gbs},
-                    "hw_patch": {},
-                    "out_dir": out_dir,
-                }
-            )
-        _dbg(debug, f"[designer][fallback] default experiments created: {len(exps)}")
-        return exps
+        raise RuntimeError("llm generate experiments failed")
 
-    # ---- LLM create (cached) ----
     llm = get_llm_for_agent("designer")
-    system_prompt = designer_prompt  # 来自 backend/agent/prompts/designer.py
+    system_prompt = designer_prompt
     SAMPLES_DIR = os.path.join(os.path.dirname(__file__), "..", "configs", "samples")
     sample_model = read_json(os.path.join(SAMPLES_DIR, "model.json"))
     sample_run = read_json(os.path.join(SAMPLES_DIR, "run.json"))
     sample_hw = read_json(os.path.join(SAMPLES_DIR, "hw.json"))
 
+    # memories 只压缩关键字段（避免 prompt 膨胀）
+    memories_compact: List[Dict[str, Any]] = []
+    if memories:
+        for m in memories[:5]:
+            memories_compact.append(
+                {
+                    "memory": m.get("memory"),
+                    "metadata": m.get("metadata", {}),
+                    "created_at": m.get("created_at"),
+                }
+            )
 
-    # ---- 给 LLM 的“可控、结构化”输入 ----
-    # 关键：你要明确你系统支持的 patch 语义（用 dot-key），并且告诉它不要发明字段
     llm_req: Dict[str, Any] = {
         "task": "design_experiments",
         "rules": [
@@ -79,9 +75,11 @@ def gen_experiments(user_intent: str, run_id: str, debug: bool) -> List[Experime
             "Do NOT include 'out_dir' in experiments; the caller will attach it.",
             "Do NOT reference files. Do NOT assume paths.",
             "Keep experiments count between 3 and 12 unless user explicitly asks otherwise.",
+            "If retrieved_memories show plans were rejected or edited, avoid repeating those incorrect patterns.",
         ],
         "context": {
             "user_intent": user_intent,
+            "retrieved_memories": memories_compact,
             "experiment_goal_hint": "Typical goal: control variables; sweep one or two knobs; detect failure boundary.",
             "allowed_patch_scopes": {
                 "model_patch": "model config overrides (dict)",
@@ -91,9 +89,9 @@ def gen_experiments(user_intent: str, run_id: str, debug: bool) -> List[Experime
             "could_patch_keys": [
                 {"model": sample_model},
                 {"run": sample_run},
-                {"hw": sample_hw}
+                {"hw": sample_hw},
             ],
-            "base_out_dir": base_out,  # 仅作为信息，LLM 不应直接输出路径
+            "base_out_dir": base_out,
         },
         "output_schema": {
             "experiments": [
@@ -110,7 +108,6 @@ def gen_experiments(user_intent: str, run_id: str, debug: bool) -> List[Experime
 
     prompt = json.dumps(llm_req, ensure_ascii=False)
 
-    # ---- call LLM ----
     try:
         resp = llm.invoke(
             [
@@ -122,7 +119,6 @@ def gen_experiments(user_intent: str, run_id: str, debug: bool) -> List[Experime
         _dbg(debug, f"[designer][llm] invoke failed: {e}")
         return _fallback_default()
 
-    # ---- parse JSON ----
     try:
         llm_json = json.loads(resp.content)
     except Exception as e:
@@ -131,11 +127,9 @@ def gen_experiments(user_intent: str, run_id: str, debug: bool) -> List[Experime
 
     _dbg(debug, f"[designer][llm] raw={str(llm_json)[:800]}")
 
-    # ---- validate + normalize ----
     exps_raw = llm_json.get("experiments")
     if not isinstance(exps_raw, list) or not exps_raw:
         _dbg(debug, "[designer][llm] 'experiments' missing or empty -> fallback")
-        # TODO: LLM返回非异常怎么处理
         return _fallback_default()
 
     normalized: List[ExperimentSpec] = []
@@ -155,10 +149,9 @@ def gen_experiments(user_intent: str, run_id: str, debug: bool) -> List[Experime
         run_patch = e.get("run_patch", {})
         hw_patch = e.get("hw_patch", {})
 
-        # basic checks
         if not exp_id:
             exp_id = f"exp_{idx:02d}"
-        # exp_id 规范化：只保留安全字符（防止路径/奇怪字符）
+
         safe = []
         for ch in exp_id:
             if ch.isalnum() or ch in ("_", "-", "."):
@@ -178,7 +171,6 @@ def gen_experiments(user_intent: str, run_id: str, debug: bool) -> List[Experime
             _dbg(debug, f"[designer][llm] patch type invalid for {exp_id} -> skip")
             continue
 
-        # 附加 out_dir（由本地统一生成）
         out_dir = os.path.join(base_out, exp_id)
 
         normalized.append(
@@ -200,6 +192,7 @@ def gen_experiments(user_intent: str, run_id: str, debug: bool) -> List[Experime
     return normalized
 
 
+
 def _split_results(results: List[ExamResult]) -> Tuple[List[ExamResult], List[ExamResult]]:
     succ, fail = [], []
     for r in results:
@@ -210,7 +203,7 @@ def _split_results(results: List[ExamResult]) -> Tuple[List[ExamResult], List[Ex
     return succ, fail
 
 
-def designer_agent(state: GlobalState):
+def designer_agent(state: GlobalState, config: RunnableConfig):
     """
     designer_agent：
     1) 设计实验（plan-and-solve + react）
@@ -238,12 +231,20 @@ def designer_agent(state: GlobalState):
         if not user_intent:
             raise ValueError("user_intent invalid")
 
-        experiments = gen_experiments(user_intent, run_id, debug)
+        # ✅ 从 DI 取 mem_store，检索记忆（best-effort）
+        memories: List[Dict[str, Any]] = []
+        store = _get_mem_store(config)
+        if store is not None:
+            # try:
+                memories = store.search_for_designer(state=dict(state), query=user_intent, top_k=5)
+                _dbg(debug, f"[designer][mem0] retrieved memories: {len(memories)}")
+            # except Exception as e:
+            #     _dbg(debug, f"[designer][mem0] search failed: {e}")
+
+        experiments = gen_experiments(user_intent, run_id, debug, memories=memories)
 
         _dbg(debug, f"[designer] planned {len(experiments)} experiments; wait human review")
 
-        # ✅ 最小改动：不再 Send，改为进入 need_human
-        # 字段名 experiments_plan 提供给 human_review 节点展示/编辑
         return {
             "stage": "need_human",
             "run_id": run_id,

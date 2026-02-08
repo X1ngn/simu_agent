@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List
 
+from langchain_core.runnables import RunnableConfig
+
 from backend.agent.state import GlobalState, AnalystReport, ExamResult
 from backend.agent.tools.csv_io import read_csv_head_row, read_csv_all, write_csv
 
@@ -117,7 +119,7 @@ def analyze_data(debug, state, rows, anomalies, summary_path) -> None:
     return llm_json
 
 
-def analyst_agent(state: GlobalState) -> Dict[str, Any]:
+def analyst_agent(state: GlobalState, config: RunnableConfig) -> Dict[str, Any]:
     """
     analyst_agent（ReAct）：读取每个实验 csv 的头行汇总为 summary.csv。
     如发现异常（例如 throughput 为 0 或 peak_mem 异常爆炸），可进一步读全量做诊断。
