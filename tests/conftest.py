@@ -1,10 +1,17 @@
+import os, sys
 import pytest
-from helpers.fakes import FakeDesigner, FakeHumanReview, FakeWorker, FakeAnalyst
-from helpers.build_app import build_test_app
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from backend.agent.graph import build_graph
+from tests.helpers.trace import TraceRecorder, wrap_node
+from tests.helpers import stubs
 
 @pytest.fixture
-def config():
-    return {"configurable": {"thread_id": "pytest_thread"}}
+def config(request):
+    return {"configurable": {"thread_id": request.node.name}}
 
 @pytest.fixture
 def init_state():
@@ -17,19 +24,19 @@ def init_state():
     }
 
 @pytest.fixture
-def fakes():
-    return {
-        "designer": FakeDesigner(),
-        "human_review": FakeHumanReview(),
-        "worker": FakeWorker(),
-        "analyst": FakeAnalyst(ok=True),
-    }
+def trace():
+    return TraceRecorder()
 
 @pytest.fixture
-def app(fakes):
-    return build_test_app(
-        designer=fakes["designer"],
-        human_review=fakes["human_review"],
-        worker=fakes["worker"],
-        analyst=fakes["analyst"],
-    )
+def app_stubbed(trace):
+    """
+    返回一个“全 stub 节点”的图，用于 graph/perf 基础测试。
+    TODO:
+    - 你也可以在具体测试里自己 build_graph(...) 来覆盖不同分支
+    """
+    designer = wrap_node(trace, "designer", stubs.stub_designer_need_human)
+    human = wrap_node(trace, "human_review", stubs.stub_human_review_interrupt)
+    worker = wrap_node(trace, "exam_worker", stubs.stub_worker_collect)
+    analyst = wrap_node(trace, "analyst", stubs.stub_analyst_ok)
+    app = build_graph(designer=designer, human_review=human, worker=worker, analyst=analyst)
+    return app

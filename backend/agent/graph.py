@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
-
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
 
-from state import GlobalState
-from agents.designer import designer_agent
-from agents.exam_worker import exam_worker
-from agents.analyst import analyst_agent
-from agents.human_review import human_review_node
+from backend.agent.state import GlobalState
+from backend.agent.agents.designer import designer_agent
+from backend.agent.agents.exam_worker import exam_worker
+from backend.agent.agents.analyst import analyst_agent
+from backend.agent.agents.human_review import human_review_node
 
 
 def _route_after_designer(state: GlobalState) -> str:
@@ -55,8 +53,7 @@ def _route_after_analyst(state: GlobalState) -> str:
 
 
 # backend/agent/graph.py
-
-from typing import Callable, Any, Optional
+from typing import Optional, Sequence
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 def build_graph(
@@ -65,6 +62,7 @@ def build_graph(
     worker=exam_worker,
     analyst=analyst_agent,
     checkpointer: Optional[BaseCheckpointSaver] = None,
+    interrupt_before: Optional[Sequence[str]] = None,   # ✅ 新增
 ):
     g = StateGraph(GlobalState)
 
@@ -83,5 +81,9 @@ def build_graph(
     if checkpointer is None:
         checkpointer = MemorySaver()
 
-    return g.compile(checkpointer=checkpointer, interrupt_before=None)
+    return g.compile(
+        checkpointer=checkpointer,
+        interrupt_before=interrupt_before,   # ✅ 透传
+    )
+
 

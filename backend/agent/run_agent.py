@@ -5,11 +5,10 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Literal, Callable
 
-from graph import build_graph
-
 from langgraph.types import Command
 
 from backend.agent.memory import Mem0MilvusMemoryStore
+from backend.agent.graph import build_graph
 
 # =========================
 # HITL 高内聚处理模块

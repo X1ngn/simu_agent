@@ -9,8 +9,8 @@ from typing import Any, Dict, List, Optional
 from mem0 import Memory
 from langchain_core.runnables import RunnableConfig
 from dotenv import load_dotenv
-from prompts.custom_fact_extraction_prompt import custom_fact_extraction_prompt
-from prompts.custom_update_memory_prompt import custom_update_memory_prompt
+from backend.agent.prompts.custom_fact_extraction_prompt import custom_fact_extraction_prompt
+from backend.agent.prompts.custom_update_memory_prompt import custom_update_memory_prompt
 
 @dataclass(frozen=True)
 class Mem0MilvusStoreConfig:

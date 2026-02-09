@@ -1,4 +1,3 @@
-# tests/unit/test_routes.py
 import pytest
 from langgraph.graph import END
 from backend.agent.graph import _route_after_designer, _route_after_analyst
@@ -13,8 +12,8 @@ from backend.agent.graph import _route_after_designer, _route_after_analyst
     ("need_redesign", "designer"),
     ("init", "designer"),
 ])
+
 def test_route_after_designer(stage, expected):
-    # TODO: 如果 GlobalState 需要其他字段，这里补齐
     assert _route_after_designer({"stage": stage}) == expected
 
 @pytest.mark.unit
