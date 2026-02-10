@@ -317,4 +317,4 @@ def _get_mem_store(config: Optional[RunnableConfig]) -> Optional[Mem0MilvusMemor
         return None
     cfg = (config.get("configurable") or {})  # type: ignore
     store = cfg.get("mem_store")
-    return store if isinstance(store, Mem0MilvusMemoryStore) else None
+    return store

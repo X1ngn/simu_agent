@@ -55,7 +55,10 @@ class DummyMemStore:
 
         return _noop
 
-
+'''
+$env:RUN_E2E_LATENCY_REAL="1"
+pytest -s -q tests/e2e_judge/test_e2e_latency_breakdown_real.py::test_e2e_latency_breakdown_real_system
+'''
 @pytest.mark.e2e_judge
 @pytest.mark.skipif(
     os.getenv("RUN_E2E_LATENCY_REAL") != "1",
