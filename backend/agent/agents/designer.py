@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import uuid
 from typing import Any, Dict, List, Tuple, Optional
 
@@ -11,7 +10,6 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command, Send
 from langgraph.graph import END
-from langchain_core.messages import AIMessage
 
 from backend.agent.state import GlobalState, ExperimentSpec, ExamResult
 from backend.agent.tools.json_io import read_json
@@ -45,7 +43,6 @@ def _messages_tail(state: Dict[str, Any], n: int = 20) -> List[Dict[str, str]]:
     tail = msgs[-n:]
     out: List[Dict[str, str]] = []
     for m in tail:
-        # BaseMessage 通常有 type/content
         out.append(
             {
                 "type": getattr(m, "type", m.__class__.__name__),
@@ -57,15 +54,12 @@ def _messages_tail(state: Dict[str, Any], n: int = 20) -> List[Dict[str, str]]:
 
 def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
     """
-    解决你遇到的：模型在 JSON 后面追加自然语言导致 json.loads() 失败。
-    策略：
-      1) 先尝试整体 json.loads
-      2) 失败就用“从第一个 { 到最后一个 }”截取再 parse
-      3) 仍失败就返回 None
+    解决“结构化JSON后面跟自然语言”导致 json.loads 失败。
+    1) 先整体 parse
+    2) 失败则截取第一个 { 到最后一个 } 再 parse
     """
     if not text:
         return None
-
     text = text.strip()
     try:
         obj = json.loads(text)
@@ -85,6 +79,104 @@ def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _dict_keys_topk(x: Any, k: int = 30) -> List[str]:
+    """安全提取 dict 的 key 列表；非 dict 返回空。"""
+    if not isinstance(x, dict):
+        return []
+    return [str(t) for t in list(x.keys())[:k]]
+
+
+# -------------------------
+# 0) summarize intent (LLM)  ✅ NEW (fixed)
+# -------------------------
+
+async def _llm_summarize_intent(
+    *,
+    llm: Any,
+    system_prompt: str,
+    state: Dict[str, Any],
+    experiments_plan: List[ExperimentSpec],
+    debug: bool,
+) -> str:
+    """
+    在进入 need_human 前，把：
+      - 初始 user_intent
+      - 对话上下文（messages tail）
+      - clarify_answers（如有）
+      - 当前生成的 experiments_plan（仅做摘要参考）
+    总结为“可长期记忆”的完整 user_intent，并写回 state["user_intent"]。
+
+    返回：updated_user_intent（字符串）。失败则返回原 user_intent。
+    """
+    original_intent = str(state.get("user_intent") or "").strip()
+    if not original_intent:
+        return original_intent
+
+    # 避免 prompt 膨胀：只给必要信息
+    plan_compact: List[Dict[str, Any]] = []
+    for e in (experiments_plan or [])[:12]:
+        if not isinstance(e, dict):
+            continue
+        plan_compact.append(
+            {
+                "exp_id": e.get("exp_id"),
+                "description": e.get("description"),
+                "model_patch_keys": _dict_keys_topk(e.get("model_patch")),
+                "run_patch_keys": _dict_keys_topk(e.get("run_patch")),   # ✅ FIX: [:30] 而不是 [:30,]
+                "hw_patch_keys": _dict_keys_topk(e.get("hw_patch")),
+            }
+        )
+
+    llm_req: Dict[str, Any] = {
+        "task": "summarize_user_intent_for_long_term_memory",
+        "rules": [
+            "Return STRICT JSON ONLY. No markdown. No extra commentary.",
+            "Output must be a JSON object with key: updated_user_intent (string).",
+            "updated_user_intent must be a single concise but complete paragraph (Chinese).",
+            "It must include: goal, controlled variables, sweep knobs + range (if known), hardware assumptions, failure boundary definition (if known), and any constraints mentioned by user.",
+            "Do NOT include raw full experiment JSON; just summarize the intent and constraints.",
+            "If some info is unknown, explicitly mark as '未指定'.",
+        ],
+        "context": {
+            "original_user_intent": original_intent,
+            "dialog_tail": _messages_tail(state, 30),
+            "clarify_answers": state.get("clarify_answers", {}) or {},
+            "last_rejection": state.get("last_rejection"),
+            "last_failures": state.get("last_failures"),
+            "experiments_plan_compact": plan_compact,
+        },
+        "output_schema": {"updated_user_intent": "string"},
+    }
+
+    try:
+        resp = await llm.ainvoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=json.dumps(llm_req, ensure_ascii=False)),
+            ]
+        )
+    except Exception as e:
+        _dbg(debug, f"[designer][intent_summarize] ainvoke failed: {e}")
+        return original_intent
+
+    parsed = _extract_first_json_object(getattr(resp, "content", "") or "")
+    if not parsed:
+        _dbg(debug, f"[designer][intent_summarize] bad json, content={getattr(resp, 'content', '')[:300]}")
+        return original_intent
+
+    updated = str(parsed.get("updated_user_intent") or "").strip()
+    if not updated:
+        return original_intent
+
+    # 轻量防抖：太短/明显无效则回退
+    if len(updated) < max(20, len(original_intent) // 4):
+        return original_intent
+
+    if debug:
+        _dbg(debug, f"[designer][intent_summarize] updated_user_intent={updated}")
+    return updated
+
+
 # -------------------------
 # 1) clarify policy (LLM)
 # -------------------------
@@ -98,16 +190,6 @@ async def _llm_need_clarify(
     memories: List[Dict[str, Any]],
     debug: bool,
 ) -> Dict[str, Any]:
-    """
-    让 LLM 判断：是否信息足够支撑实验设计；不足则给出澄清问题列表（结构化）。
-    返回：
-      {
-        "need_more_info": bool,
-        "questions": [{"key","question","type","choices?"}, ...],
-        "notes": "...",
-      }
-    """
-    # 压缩 memories（防止 prompt 膨胀）
     mem_compact: List[Dict[str, Any]] = []
     for m in (memories or [])[:5]:
         mem_compact.append(
@@ -158,7 +240,6 @@ async def _llm_need_clarify(
     )
     parsed = _extract_first_json_object(getattr(resp, "content", "") or "")
     if not parsed:
-        # 解析失败时：保守策略——不澄清，继续生成（避免卡死）
         return {"need_more_info": False, "questions": [], "notes": "llm_output_unparseable"}
 
     need_more = bool(parsed.get("need_more_info", False))
@@ -167,7 +248,6 @@ async def _llm_need_clarify(
         questions = []
     notes = str(parsed.get("notes") or "")
 
-    # 规范化 questions
     norm_qs: List[Dict[str, Any]] = []
     for q in questions[:5]:
         if not isinstance(q, dict):
@@ -207,10 +287,6 @@ async def gen_experiments(
     state: Dict[str, Any],
     memories: List[Dict[str, Any]] | None = None,
 ) -> List[ExperimentSpec]:
-    """
-    使用 LLM 根据 user_intent + (messages/clarify_answers/失败&拒绝证据/历史记忆) 生成实验设计。
-    """
-
     base_out = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "data", "runs", run_id)
     )
@@ -221,13 +297,11 @@ async def gen_experiments(
     llm = get_llm_for_agent("designer")
     system_prompt = designer_prompt
 
-    # 你的样例 config（用于约束可 patch 的 key 空间）
     SAMPLES_DIR = os.path.join(os.path.dirname(__file__), "..", "configs", "samples")
     sample_model = read_json(os.path.join(SAMPLES_DIR, "model.json"))
     sample_run = read_json(os.path.join(SAMPLES_DIR, "run.json"))
     sample_hw = read_json(os.path.join(SAMPLES_DIR, "hw.json"))
 
-    # 压缩 memories
     memories_compact: List[Dict[str, Any]] = []
     for m in (memories or [])[:5]:
         memories_compact.append(
@@ -285,7 +359,6 @@ async def gen_experiments(
 
     prompt = json.dumps(llm_req, ensure_ascii=False)
 
-    # ✅ async llm call
     try:
         resp = await llm.ainvoke(
             [
@@ -297,7 +370,6 @@ async def gen_experiments(
         _dbg(debug, f"[designer][llm] ainvoke failed: {e}")
         return _fallback_default()
 
-    # ✅ robust JSON parse（兼容“JSON后面跟自然语言”）
     llm_json = _extract_first_json_object(getattr(resp, "content", "") or "")
     if not llm_json:
         _dbg(debug, f"[designer][llm] bad json (cannot parse), content={getattr(resp, 'content', '')[:300]}")
@@ -310,7 +382,6 @@ async def gen_experiments(
         _dbg(debug, "[designer][llm] 'experiments' missing or empty -> fallback")
         return _fallback_default()
 
-    # normalize + attach out_dir
     normalized: List[ExperimentSpec] = []
     seen_ids: set[str] = set()
 
@@ -331,7 +402,6 @@ async def gen_experiments(
         if not exp_id:
             exp_id = f"exp_{idx:02d}"
 
-        # exp_id 规范化（安全字符）
         safe = []
         for ch in exp_id:
             if ch.isalnum() or ch in ("_", "-", "."):
@@ -386,20 +456,6 @@ def _split_results(results: List[ExamResult]) -> Tuple[List[ExamResult], List[Ex
 
 
 async def designer_agent(state: GlobalState, config: RunnableConfig):
-    """
-    受 ReAct 启发的“图状态驱动澄清子范式”：
-
-    stage init/design:
-      1) LLM判断是否需要澄清 -> need_user 则 END（交给 human_review_node interrupt）
-      2) 信息足够 -> 生成 experiments_plan -> stage=need_human
-
-    stage dispatch_ready:
-      人审通过 -> Send 分发 exam_worker (保持你原逻辑)
-
-    stage collect:
-      有失败 -> 写 last_failures + messages -> 回到 design（第一步）
-      全成功 -> stage=analyze（进入 analyst 节点）
-    """
     debug = bool(state.get("debug", False))
     stage = state.get("stage", "init")
     retries = int(state.get("retries", 0) or 0)
@@ -407,22 +463,18 @@ async def designer_agent(state: GlobalState, config: RunnableConfig):
 
     _dbg(debug, f"[designer] enter stage={stage}, retries={retries}/{max_retries}")
 
-    # -------------------------
-    # init/design: clarify or plan
-    # -------------------------
     if stage in ("init", "design"):
         run_id = state.get("run_id") or _make_run_id()
         user_intent = str(state.get("user_intent") or "").strip()
         if not user_intent:
             raise ValueError("user_intent invalid")
 
-        # 记录 intent 到 messages（幂等）
         updates: Dict[str, Any] = {"run_id": run_id}
+
         if not state.get("_intent_logged"):
             updates["messages"] = [HumanMessage(content=user_intent)]
             updates["_intent_logged"] = True
 
-        # mem0 retrieval (best-effort)
         memories: List[Dict[str, Any]] = []
         store = _get_mem_store(config)
         if store is not None:
@@ -439,7 +491,6 @@ async def designer_agent(state: GlobalState, config: RunnableConfig):
 
         llm = get_llm_for_agent("designer")
 
-        # 1) clarify decision
         clarify = await _llm_need_clarify(
             llm=llm,
             system_prompt=designer_prompt,
@@ -455,16 +506,14 @@ async def designer_agent(state: GlobalState, config: RunnableConfig):
             updates["clarify_questions"] = questions
             updates["clarify_notes"] = clarify.get("notes", "")
 
-            # ✅ 把提问写入 messages（依赖 add_messages reducer 追加）
-            q_text = "\n".join([f"- ({q.get('key')}) {q.get('question')}" for q in questions if isinstance(q, dict)])
+            q_text = "\n".join(
+                [f"- ({q.get('key')}) {q.get('question')}" for q in questions if isinstance(q, dict)]
+            )
             updates["messages"] = updates.get("messages", []) + [
                 AIMessage(content=f"[CLARIFY] Need more info:\n{q_text}")
             ]
-
-            # ✅ 关键：END 时也要把 updates 全写回
             return Command(goto=END, update=updates)
 
-        # 2) enough info -> generate plan
         experiments = await gen_experiments(
             user_intent=user_intent,
             run_id=run_id,
@@ -473,19 +522,32 @@ async def designer_agent(state: GlobalState, config: RunnableConfig):
             memories=memories,
         )
 
+        updated_intent = await _llm_summarize_intent(
+            llm=llm,
+            system_prompt=designer_prompt,
+            state=dict(state),
+            experiments_plan=experiments,
+            debug=debug,
+        )
+
         updates.update(
             {
                 "stage": "need_human",
                 "run_id": run_id,
+                "user_intent": updated_intent,
                 "experiments_plan": experiments,
-                "messages": [AIMessage(content=f"[PLAN] generated {len(experiments)} experiments; awaiting human review")],
+                "messages": updates.get("messages", []) + [
+                    AIMessage(
+                        content=(
+                            f"[PLAN] generated {len(experiments)} experiments; "
+                            f"user_intent consolidated; awaiting human review"
+                        )
+                    )
+                ],
             }
         )
         return updates
 
-    # -------------------------
-    # dispatch_ready: fan-out
-    # -------------------------
     if stage == "dispatch_ready":
         run_id = state.get("run_id") or _make_run_id()
         user_intent = str(state.get("user_intent") or "").strip()
@@ -497,10 +559,7 @@ async def designer_agent(state: GlobalState, config: RunnableConfig):
             raise ValueError("experiments invalid: nothing to dispatch")
 
         sends = [
-            Send(
-                "exam_worker",
-                {"current_experiment": exp, "debug": debug, "run_id": run_id},
-            )
+            Send("exam_worker", {"current_experiment": exp, "debug": debug, "run_id": run_id})
             for exp in experiments
         ]
 
@@ -511,7 +570,7 @@ async def designer_agent(state: GlobalState, config: RunnableConfig):
                 "stage": "collect",
                 "run_id": run_id,
                 "user_intent": user_intent,
-                "experiments": experiments,  # 固化已批准
+                "experiments": experiments,
                 "pending": len(experiments),
                 "exam_results": [],
                 "failed_results": [],
@@ -521,9 +580,6 @@ async def designer_agent(state: GlobalState, config: RunnableConfig):
             goto=sends,
         )
 
-    # -------------------------
-    # collect: fan-in
-    # -------------------------
     if stage == "collect":
         pending = int(state.get("pending", 0) or 0)
         results = state.get("exam_results", []) or []
@@ -536,20 +592,14 @@ async def designer_agent(state: GlobalState, config: RunnableConfig):
         succ, fail = _split_results(results2)
         _dbg(debug, f"[designer] collected results: success={len(succ)}, fail={len(fail)}")
 
-        # 4) 有失败 -> 回到第一步（design），把失败摘要写入 messages + last_failures
         if fail:
             fail_brief = {
                 "failed_count": len(fail),
                 "failed": [
-                    {
-                        "exp_id": x.get("exp_id"),
-                        "reason": x.get("reason"),
-                        "message": x.get("message"),
-                    }
+                    {"exp_id": x.get("exp_id"), "reason": x.get("reason"), "message": x.get("message")}
                     for x in fail[:8]
                 ],
             }
-            # 如果想限制重试：用 retries/max_retries 控制（可选）
             if retries >= max_retries:
                 return {
                     "stage": "need_redesign",
@@ -568,7 +618,6 @@ async def designer_agent(state: GlobalState, config: RunnableConfig):
                 "messages": [AIMessage(content=f"[WORKER_FAIL] back to clarify/design: {_safe_json(fail_brief, 2000)}")],
             }
 
-        # 全部成功：进入 analyst
         return {
             "stage": "analyze",
             "failed_results": [],
@@ -576,9 +625,6 @@ async def designer_agent(state: GlobalState, config: RunnableConfig):
             "messages": [AIMessage(content="[COLLECT_OK] all experiments succeeded -> analyze")],
         }
 
-    # -------------------------
-    # need_redesign: 兜底
-    # -------------------------
     if stage == "need_redesign":
         return {
             "stage": "done",
