@@ -8,7 +8,7 @@ import pytest
 from langchain_core.runnables import RunnableConfig
 
 from backend.agent.graph import build_graph
-from backend.agent.run_agent import handle_hitl_interrupts, HitlDecision
+from backend.agent.run_agent import handle_hitl_interrupts_async, HitlDecision
 
 from tests.helpers.trace import TraceRecorder, wrap_node
 
@@ -60,29 +60,16 @@ $env:RUN_E2E_LATENCY_REAL="1"
 pytest -s -q tests/e2e_judge/test_e2e_latency_breakdown_real.py::test_e2e_latency_breakdown_real_system
 '''
 @pytest.mark.e2e_judge
+@pytest.mark.asyncio
 @pytest.mark.skipif(
     os.getenv("RUN_E2E_LATENCY_REAL") != "1",
     reason="Real E2E latency disabled by default",
 )
-def test_e2e_latency_breakdown_real_system():
-    """
-    真实系统端到端时延（含逐节点耗时拆解）：
-    - 使用真实 designer/human_review/worker/analyst
-    - 用 decider 自动 accept，跑完整链路（直到图自然结束或达到你的终止条件）
-    - 统计 total latency + per-node breakdown
-
-    环境变量：
-      RUN_E2E_LATENCY_REAL=1      开启
-      E2E_LAT_RUNS=3              跑几次
-      E2E_LAT_PRINT_EACH=1        是否每次打印 breakdown
-      E2E_LAT_P95_THRESHOLD_S=0   可选阈值（秒）
-    """
-
+async def test_e2e_latency_breakdown_real_system():
     runs = int(os.getenv("E2E_LAT_RUNS", "3"))
     print_each = os.getenv("E2E_LAT_PRINT_EACH", "1") == "1"
     threshold_p95_s = float(os.getenv("E2E_LAT_P95_THRESHOLD_S", "0"))
 
-    # ---- 真实节点（按你项目路径）
     from backend.agent.agents.designer import designer_agent
     from backend.agent.agents.human_review import human_review_node
     from backend.agent.agents.exam_worker import exam_worker
@@ -117,7 +104,6 @@ def test_e2e_latency_breakdown_real_system():
 
         mem_store = DummyMemStore()
 
-        # ✅ 关键：用 RunnableConfig，不要用 dict
         config = RunnableConfig(
             configurable={
                 "thread_id": f"e2e_latency_real_{i}",
@@ -125,16 +111,15 @@ def test_e2e_latency_breakdown_real_system():
             }
         )
 
-        # ✅ 关键：无论 LangGraph 是否注入 config，wrap_node 都会兜底用 trace.current_config
         trace.current_config = config
 
         t0 = time.perf_counter()
-        s = app.invoke(init_state, config=config)
+        # ✅ 关键：异步图执行
+        s = await app.ainvoke(init_state, config=config)
 
-        # handle_hitl_interrupts 内部还会 app.invoke(...)，再次保证 current_config 可用
         trace.current_config = config
-        final = handle_hitl_interrupts(app, s, config=config, decider=decider_accept)
-
+        # ✅ 关键：await async HITL
+        final = await handle_hitl_interrupts_async(app, s, config=config, decider=decider_accept)
         t1 = time.perf_counter()
 
         total = t1 - t0

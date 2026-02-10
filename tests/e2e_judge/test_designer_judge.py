@@ -2,13 +2,12 @@ import os
 import json
 import pytest
 from typing import Dict, Any
-from types import SimpleNamespace
 
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
 
 from backend.agent.agents.designer import designer_agent
 from backend.agent.llm_factory import get_llm_for_agent
-from backend.agent.prompts.designer import designer_prompt
 
 
 # =========================
@@ -51,18 +50,19 @@ JUDGE_RUBRIC = {
 
 
 # =========================
-# 测试本体
+# 测试本体（异步版）
 # =========================
-'''
-$env:RUN_E2E_JUDGE="1"                                                                                      
-pytest tests/e2e_judge/test_designer_judge.py::test_designer_plan_matches_intent
-'''
+"""
+$env:RUN_E2E_JUDGE="1"
+pytest -s -q tests/e2e_judge/test_designer_judge.py::test_designer_plan_matches_intent
+"""
 @pytest.mark.e2e_judge
+@pytest.mark.asyncio
 @pytest.mark.skipif(os.getenv("RUN_E2E_JUDGE") != "1", reason="E2E judge disabled by default")
-def test_designer_plan_matches_intent():
+async def test_designer_plan_matches_intent():
     """
-    E2E Judge Test:
-    - 真实运行 designer，得到 experiments_plan
+    E2E Judge Test (async):
+    - 真实运行 designer（async），得到 experiments_plan
     - 用独立 judge LLM 评估设计是否匹配 user_intent
     - judge 输出结构化 JSON：pass/score/reasons
     - assert score >= 阈值
@@ -81,10 +81,11 @@ def test_designer_plan_matches_intent():
         "max_retries": 1,
     }
 
-    # designer 需要一个 RunnableConfig（这里只要能传下去即可）
-    config = {}
+    # ✅ 建议统一用 RunnableConfig（你生产节点也在用这个类型）
+    config = RunnableConfig(configurable={"thread_id": "e2e_judge_designer"})
 
-    out = designer_agent(state, config)
+    # ✅ 异步 designer
+    out = await designer_agent(state, config)
 
     assert out["stage"] == "need_human"
     assert "experiments_plan" in out
@@ -115,15 +116,21 @@ def test_designer_plan_matches_intent():
     # ------------------------------------------------------------
     # 3. 调用 judge LLM（temperature=0，强一致性）
     # ------------------------------------------------------------
-    # 复用designer的类创建实例
+    # 复用 designer 的 LLM 实例即可（你目前没有 judge agent 配置）
     judge_llm = get_llm_for_agent("designer")
 
-    resp = judge_llm.invoke(
+    # ✅ async LLM call
+    # 注意：不同 ChatModel 对温度参数传递方式不同：
+    # - 有的用 model.bind(temperature=0) 再 ainvoke
+    # - 有的允许 ainvoke(..., temperature=0)
+    # 这里采用最稳的 bind 方式。
+    llm0 = judge_llm.bind(temperature=0.0)
+
+    resp = await llm0.ainvoke(
         [
             SystemMessage(content=JUDGE_SYSTEM_PROMPT),
             HumanMessage(content=judge_prompt),
-        ],
-        temperature=0.0,
+        ]
     )
 
     assert resp is not None
@@ -156,10 +163,9 @@ def test_designer_plan_matches_intent():
     assert isinstance(verdict["reasons"], list)
 
     # ------------------------------------------------------------
-    # 6. 质量门槛断言（这是测试的“核心价值”）
+    # 6. 质量门槛断言（核心）
     # ------------------------------------------------------------
     threshold = JUDGE_RUBRIC["pass_threshold"]
-
     assert verdict["score"] >= threshold, (
         f"Designer plan does not sufficiently match intent.\n"
         f"Score={verdict['score']} < threshold={threshold}\n"

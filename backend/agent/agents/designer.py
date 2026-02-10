@@ -1,15 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
-from typing import List, Tuple
+import json
+from typing import Any, Dict, List, Tuple
 
 from backend.agent.state import GlobalState, ExperimentSpec, ExamResult
-
-from pathlib import Path
-import json
-from typing import Any, Dict, List
-
 from backend.agent.tools.json_io import read_json
 
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -29,7 +26,7 @@ def _make_run_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
-def gen_experiments(
+async def gen_experiments(
     user_intent: str,
     run_id: str,
     debug: bool,
@@ -48,6 +45,7 @@ def gen_experiments(
 
     llm = get_llm_for_agent("designer")
     system_prompt = designer_prompt
+
     SAMPLES_DIR = os.path.join(os.path.dirname(__file__), "..", "configs", "samples")
     sample_model = read_json(os.path.join(SAMPLES_DIR, "model.json"))
     sample_run = read_json(os.path.join(SAMPLES_DIR, "run.json"))
@@ -108,17 +106,19 @@ def gen_experiments(
 
     prompt = json.dumps(llm_req, ensure_ascii=False)
 
+    # ✅ async llm call
     try:
-        resp = llm.invoke(
+        resp = await llm.ainvoke(
             [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=prompt),
             ]
         )
     except Exception as e:
-        _dbg(debug, f"[designer][llm] invoke failed: {e}")
+        _dbg(debug, f"[designer][llm] ainvoke failed: {e}")
         return _fallback_default()
 
+    # ---- parse JSON ----
     try:
         llm_json = json.loads(resp.content)
     except Exception as e:
@@ -152,6 +152,7 @@ def gen_experiments(
         if not exp_id:
             exp_id = f"exp_{idx:02d}"
 
+        # exp_id 规范化：只保留安全字符（防止路径/奇怪字符）
         safe = []
         for ch in exp_id:
             if ch.isalnum() or ch in ("_", "-", "."):
@@ -192,7 +193,6 @@ def gen_experiments(
     return normalized
 
 
-
 def _split_results(results: List[ExamResult]) -> Tuple[List[ExamResult], List[ExamResult]]:
     succ, fail = [], []
     for r in results:
@@ -203,16 +203,13 @@ def _split_results(results: List[ExamResult]) -> Tuple[List[ExamResult], List[Ex
     return succ, fail
 
 
-def designer_agent(state: GlobalState, config: RunnableConfig):
+async def designer_agent(state: GlobalState, config: RunnableConfig):
     """
     designer_agent：
-    1) 设计实验（plan-and-solve + react）
-    2) 动态派发 N 个 exam_worker 并发执行
-    3) 收敛结果，决定：失败则分析&可能重试；成功则进入 analyst
-
-    HITL 改造（最小侵入）：
-    - init/design：只生成 experiments -> stage=need_human（不立刻 Send）
-    - dispatch_ready：人类确认后才真正 Send 分发 -> stage=dispatch
+    1) 设计实验（LLM）
+    2) HITL：先交给人审（need_human）
+    3) 人类确认后 dispatch_ready -> Send 分发 exam_worker
+    4) collect fan-in
     """
     debug = bool(state.get("debug", False))
 
@@ -227,7 +224,7 @@ def designer_agent(state: GlobalState, config: RunnableConfig):
     # ------------------------------------------------------------------
     if stage in ("init", "design"):
         run_id = state.get("run_id") or _make_run_id()
-        user_intent = state.get("user_intent", "").strip()
+        user_intent = str(state.get("user_intent") or "").strip()
         if not user_intent:
             raise ValueError("user_intent invalid")
 
@@ -235,13 +232,19 @@ def designer_agent(state: GlobalState, config: RunnableConfig):
         memories: List[Dict[str, Any]] = []
         store = _get_mem_store(config)
         if store is not None:
-            # try:
-                memories = store.search_for_designer(state=dict(state), query=user_intent, top_k=5)
+            try:
+                # store.search_for_designer 大概率是同步的 → to_thread 防止阻塞 event loop
+                memories = await asyncio.to_thread(
+                    store.search_for_designer,
+                    state=dict(state),
+                    query=user_intent,
+                    top_k=5,
+                )
                 _dbg(debug, f"[designer][mem0] retrieved memories: {len(memories)}")
-            # except Exception as e:
-            #     _dbg(debug, f"[designer][mem0] search failed: {e}")
+            except Exception as e:
+                _dbg(debug, f"[designer][mem0] search failed: {e}")
 
-        experiments = gen_experiments(user_intent, run_id, debug, memories=memories)
+        experiments = await gen_experiments(user_intent, run_id, debug, memories=memories)
 
         _dbg(debug, f"[designer] planned {len(experiments)} experiments; wait human review")
 
@@ -253,11 +256,11 @@ def designer_agent(state: GlobalState, config: RunnableConfig):
         }
 
     # ------------------------------------------------------------------
-    # (2) dispatch_ready：人类确认后，才执行你原本的 Send 分发逻辑
+    # (2) dispatch_ready：人类确认后，才执行 Send 分发逻辑
     # ------------------------------------------------------------------
     if stage == "dispatch_ready":
         run_id = state.get("run_id") or _make_run_id()
-        user_intent = state.get("user_intent", "").strip()
+        user_intent = str(state.get("user_intent") or "").strip()
         if not user_intent:
             raise ValueError("user_intent invalid")
 
@@ -265,8 +268,6 @@ def designer_agent(state: GlobalState, config: RunnableConfig):
         if not isinstance(experiments, list) or not experiments:
             raise ValueError("experiments invalid: nothing to dispatch")
 
-        # LANGGRAPH_ADJUST_HERE:
-        # 返回 Send 列表以动态创建 N 个 exam_worker 并发任务
         from langgraph.types import Send  # noqa
 
         sends = []
@@ -284,14 +285,14 @@ def designer_agent(state: GlobalState, config: RunnableConfig):
 
         _dbg(debug, f"[designer] dispatch {len(sends)} exam_worker jobs (human approved)")
 
-        from langgraph.types import Command, Send  # 放到文件顶部或函数内部都可以
+        from langgraph.types import Command
 
         return Command(
             update={
                 "stage": "collect",
                 "run_id": run_id,
                 "user_intent": user_intent,
-                "experiments": experiments,  # ✅ 固化已批准的 experiments
+                "experiments": experiments,
                 "pending": len(experiments),
                 "exam_results": [],
                 "failed_results": [],
@@ -300,51 +301,49 @@ def designer_agent(state: GlobalState, config: RunnableConfig):
             goto=sends,
         )
 
-    # stage: collect -> aggregate results and decide next
+    # ------------------------------------------------------------------
+    # (3) collect：fan-in 聚合
+    # ------------------------------------------------------------------
     if stage == "collect":
         pending = int(state.get("pending", 0) or 0)
         results = state.get("exam_results", []) or []
         _dbg(debug, f"[designer] fan-in pending={pending} results_len={len(results)}")
 
         if pending > 0:
-            # 还有 worker 没回来：别做 collect，直接结束本 tick，等下一个 worker 触发
-            return {}  # 或者干脆 return {} 也可以
+            return {}
 
-        results: List[ExamResult] = state.get("exam_results", [])  # type: ignore
-        succ, fail = _split_results(results)
-
+        results2: List[ExamResult] = state.get("exam_results", [])  # type: ignore
+        succ, fail = _split_results(results2)
         _dbg(debug, f"[designer] collected results: success={len(succ)}, fail={len(fail)}")
 
-        # 如果失败：分析原因，决定是否重试/重设计
         if fail:
-            # 简单策略：如果还没超过 max_retries，就把失败的实验去掉危险参数重跑
             if retries < max_retries:
                 _dbg(debug, "[designer] retry enabled -> redesign failed exps and re-dispatch")
 
-                # 例：把 gbs>=1024 的失败任务改成 768 重新跑
-                # TODO: 使用llm更新实验策略
                 new_exps: List[ExperimentSpec] = []
                 for r in fail:
                     exp_id = r["exp_id"]
-                    # 从原 experiments 找到 spec
-                    orig = next((e for e in state.get("experiments", []) if e["exp_id"] == exp_id), None)  # type: ignore
+                    orig = next(
+                        (e for e in (state.get("experiments", []) or []) if e.get("exp_id") == exp_id),
+                        None,
+                    )
                     if not orig:
                         continue
                     patched = dict(orig)
                     patched["exp_id"] = exp_id + "_retry"
                     patched["description"] = (orig.get("description", "") + " (retry)")
-                    # 强行降 gbs
                     patched_run_patch = dict(orig.get("run_patch", {}))
                     patched_run_patch["train.global_batch_size"] = 768
                     patched["run_patch"] = patched_run_patch
-                    # 新输出目录
+
                     base_out = os.path.abspath(
                         os.path.join(os.path.dirname(__file__), "..", "data", "runs", state["run_id"])
                     )
                     patched["out_dir"] = os.path.join(base_out, patched["exp_id"])
                     new_exps.append(patched)  # type: ignore
 
-                from langgraph.types import Send  # noqa
+                from langgraph.types import Send, Command  # noqa
+
                 sends = [
                     Send(
                         "exam_worker",
@@ -353,21 +352,18 @@ def designer_agent(state: GlobalState, config: RunnableConfig):
                     for exp in new_exps
                 ]
 
-                from langgraph.types import Command, Send
-
                 return Command(
                     update={
-                        "stage": "dispatch",
+                        "stage": "collect",
                         "retries": retries + 1,
                         "failed_results": fail,
                         "success_results": succ,
-                        "experiments": state.get("experiments", []) + new_exps,
+                        "experiments": (state.get("experiments", []) or []) + new_exps,
                         "pending": len(new_exps),
                     },
                     goto=sends,
                 )
 
-            # 超过重试次数：进入 need_redesign
             _dbg(debug, "[designer] retries exhausted -> need_redesign")
             return {
                 "stage": "need_redesign",
@@ -375,16 +371,16 @@ def designer_agent(state: GlobalState, config: RunnableConfig):
                 "success_results": succ,
             }
 
-        # 全部成功：进入 analyst
         return {
             "stage": "analyze",
             "failed_results": [],
             "success_results": succ,
         }
 
-    # stage: need_redesign -> 在这里你可以实现更复杂的“向用户追问/重新规划”
+    # ------------------------------------------------------------------
+    # (4) need_redesign：兜底
+    # ------------------------------------------------------------------
     if stage == "need_redesign":
-        # TODO：待实现真正的整合错误信息、向用户追问、重新规划功能，当前逻辑直接返回
         return {
             "stage": "done",
             "analyst_report": {
@@ -394,5 +390,4 @@ def designer_agent(state: GlobalState, config: RunnableConfig):
             },
         }
 
-    # 默认兜底
     return {"stage": "done"}

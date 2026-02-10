@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from backend.agent.agents.designer import designer_agent
 from backend.agent.state import GlobalState
+from langchain_core.runnables import RunnableConfig
 
 
 # =========================
@@ -11,21 +12,26 @@ from backend.agent.state import GlobalState
 # =========================
 
 class FakeLLM:
-    """最小 LLM stub：只实现 invoke，返回带 content 的对象"""
+    """最小 LLM stub：同时支持 invoke/ainvoke"""
 
     def __init__(self, content: str):
         self._content = content
 
     def invoke(self, messages):
-        # designer 只用 resp.content
         return SimpleNamespace(content=self._content)
+
+    async def ainvoke(self, messages):
+        return SimpleNamespace(content=self._content)
+
+    def bind(self, **kwargs):
+        # 兼容 judge/temperature=0 这类 bind 用法
+        return self
 
 
 class FakeMemStore:
     """memory store stub"""
 
     def search_for_designer(self, state, query, top_k=5):
-        # 返回“历史记忆”，但对本测试不重要
         return [
             {
                 "memory": "previous plan rejected due to OOM",
@@ -34,10 +40,11 @@ class FakeMemStore:
             }
         ]
 
-
-class DummyConfig(dict):
-    """RunnableConfig 最小替代（本测试只关心能被 _get_mem_store 使用）"""
-    pass
+    def __getattr__(self, name: str):
+        # 兜底：human_review / 其它地方调用 store.xxx 不至于崩
+        def _noop(*args, **kwargs):
+            return None
+        return _noop
 
 
 # =========================
@@ -47,28 +54,19 @@ class DummyConfig(dict):
 def patch_llm_and_memory(monkeypatch, llm_content: str):
     """
     正确 patch 点：
-    - designer 模块内已经 import 的符号
+    - patch designer 模块内已 import 的符号（designer_mod.get_llm_for_agent / designer_mod._get_mem_store）
     """
     import backend.agent.agents.designer as designer_mod
 
-    monkeypatch.setattr(
-        designer_mod,
-        "get_llm_for_agent",
-        lambda role: FakeLLM(llm_content),
-    )
+    monkeypatch.setattr(designer_mod, "get_llm_for_agent", lambda role: FakeLLM(llm_content))
+    monkeypatch.setattr(designer_mod, "_get_mem_store", lambda config: FakeMemStore())
 
-    monkeypatch.setattr(
-        designer_mod,
-        "_get_mem_store",
-        lambda config: FakeMemStore(),
-    )
+    assert isinstance(designer_mod.get_llm_for_agent("designer"), FakeLLM)
 
-    import backend.agent.agents.designer as designer_mod
 
-    assert isinstance(
-        designer_mod.get_llm_for_agent("designer"),
-        FakeLLM
-    )
+def _mk_config() -> RunnableConfig:
+    # ✅ 用 RunnableConfig，避免你生产代码里 _get_mem_store(config) 依赖 config.configurable
+    return RunnableConfig(configurable={"thread_id": "unit_test", "mem_store": FakeMemStore()})
 
 
 # =========================
@@ -76,7 +74,8 @@ def patch_llm_and_memory(monkeypatch, llm_content: str):
 # =========================
 
 @pytest.mark.unit
-def test_designer_generates_experiments_plan(monkeypatch):
+@pytest.mark.asyncio
+async def test_designer_generates_experiments_plan(monkeypatch):
     """
     覆盖分支：
     - stage=init
@@ -105,9 +104,9 @@ def test_designer_generates_experiments_plan(monkeypatch):
         "retries": 0,
         "max_retries": 1,
     }
-    config = DummyConfig()
+    config = _mk_config()
 
-    out = designer_agent(state, config)
+    out = await designer_agent(state, config)
 
     assert out["stage"] == "need_human"
     assert "experiments_plan" in out
@@ -125,7 +124,8 @@ def test_designer_generates_experiments_plan(monkeypatch):
 # =========================
 
 @pytest.mark.unit
-def test_designer_llm_bad_json_fallback(monkeypatch):
+@pytest.mark.asyncio
+async def test_designer_llm_bad_json_fallback(monkeypatch):
     """
     覆盖分支：
     - LLM 返回非 JSON
@@ -142,10 +142,10 @@ def test_designer_llm_bad_json_fallback(monkeypatch):
         "retries": 0,
         "max_retries": 1,
     }
-    config = DummyConfig()
+    config = _mk_config()
 
     with pytest.raises(RuntimeError):
-        designer_agent(state, config)
+        await designer_agent(state, config)
 
 
 # =========================
@@ -153,7 +153,8 @@ def test_designer_llm_bad_json_fallback(monkeypatch):
 # =========================
 
 @pytest.mark.unit
-def test_designer_empty_experiments_fallback(monkeypatch):
+@pytest.mark.asyncio
+async def test_designer_empty_experiments_fallback(monkeypatch):
     """
     覆盖分支：
     - LLM 返回 {"experiments": []}
@@ -171,7 +172,7 @@ def test_designer_empty_experiments_fallback(monkeypatch):
         "retries": 0,
         "max_retries": 1,
     }
-    config = DummyConfig()
+    config = _mk_config()
 
     with pytest.raises(RuntimeError):
-        designer_agent(state, config)
+        await designer_agent(state, config)
