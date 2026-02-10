@@ -1,21 +1,28 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import uuid
 import json
-from typing import Any, Dict, List, Tuple
+import os
+import re
+import uuid
+from typing import Any, Dict, List, Tuple, Optional
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.types import Command, Send
+from langgraph.graph import END
+from langchain_core.messages import AIMessage
 
 from backend.agent.state import GlobalState, ExperimentSpec, ExamResult
 from backend.agent.tools.json_io import read_json
-
-from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_core.runnables import RunnableConfig
-
 from backend.agent.llm_factory import get_llm_for_agent
 from backend.agent.prompts.designer import designer_prompt
 from backend.agent.memory import _get_mem_store
 
+
+# -------------------------
+# utils
+# -------------------------
 
 def _dbg(debug: bool, msg: str) -> None:
     if debug:
@@ -26,16 +33,184 @@ def _make_run_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def _safe_json(obj: Any, max_chars: int = 8000) -> str:
+    s = json.dumps(obj, ensure_ascii=False, default=str)
+    if len(s) > max_chars:
+        return s[: max_chars - 20] + "...(truncated)"
+    return s
+
+
+def _messages_tail(state: Dict[str, Any], n: int = 20) -> List[Dict[str, str]]:
+    msgs = state.get("messages") or []
+    tail = msgs[-n:]
+    out: List[Dict[str, str]] = []
+    for m in tail:
+        # BaseMessage 通常有 type/content
+        out.append(
+            {
+                "type": getattr(m, "type", m.__class__.__name__),
+                "content": getattr(m, "content", ""),
+            }
+        )
+    return out
+
+
+def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """
+    解决你遇到的：模型在 JSON 后面追加自然语言导致 json.loads() 失败。
+    策略：
+      1) 先尝试整体 json.loads
+      2) 失败就用“从第一个 { 到最后一个 }”截取再 parse
+      3) 仍失败就返回 None
+    """
+    if not text:
+        return None
+
+    text = text.strip()
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+
+    i = text.find("{")
+    j = text.rfind("}")
+    if i >= 0 and j > i:
+        cand = text[i : j + 1]
+        try:
+            obj = json.loads(cand)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+# -------------------------
+# 1) clarify policy (LLM)
+# -------------------------
+
+async def _llm_need_clarify(
+    *,
+    llm: Any,
+    system_prompt: str,
+    user_intent: str,
+    state: Dict[str, Any],
+    memories: List[Dict[str, Any]],
+    debug: bool,
+) -> Dict[str, Any]:
+    """
+    让 LLM 判断：是否信息足够支撑实验设计；不足则给出澄清问题列表（结构化）。
+    返回：
+      {
+        "need_more_info": bool,
+        "questions": [{"key","question","type","choices?"}, ...],
+        "notes": "...",
+      }
+    """
+    # 压缩 memories（防止 prompt 膨胀）
+    mem_compact: List[Dict[str, Any]] = []
+    for m in (memories or [])[:5]:
+        mem_compact.append(
+            {
+                "memory": m.get("memory"),
+                "metadata": m.get("metadata", {}),
+                "created_at": m.get("created_at"),
+            }
+        )
+
+    llm_req: Dict[str, Any] = {
+        "task": "clarify_user_intent_for_experiment_design",
+        "rules": [
+            "Return STRICT JSON ONLY. No markdown. No extra commentary.",
+            "Output must be a JSON object with keys: need_more_info (bool), questions (list), notes (string).",
+            "If need_more_info is false, questions must be an empty list.",
+            "Each question must include: key, question, type. type in {text, choice, json}.",
+            "If type is choice, include choices (list of strings).",
+            "Ask the MINIMUM number of questions needed (typically 1-3).",
+        ],
+        "context": {
+            "user_intent": user_intent,
+            "dialog_tail": _messages_tail(state, 20),
+            "clarify_answers": state.get("clarify_answers", {}) or {},
+            "last_rejection": state.get("last_rejection"),
+            "last_failures": state.get("last_failures"),
+            "retrieved_memories": mem_compact,
+            "hint": [
+                "If hardware/model/runtime constraints are unclear, ask about them.",
+                "If sweep variable is unclear, ask what to sweep and its range.",
+                "If success metric/failure boundary definition is unclear, ask what to treat as failure.",
+            ],
+        },
+        "output_schema": {
+            "need_more_info": True,
+            "questions": [
+                {"key": "hardware", "question": "请提供硬件信息（GPU型号/数量）", "type": "text"},
+            ],
+            "notes": "short",
+        },
+    }
+
+    resp = await llm.ainvoke(
+        [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=json.dumps(llm_req, ensure_ascii=False)),
+        ]
+    )
+    parsed = _extract_first_json_object(getattr(resp, "content", "") or "")
+    if not parsed:
+        # 解析失败时：保守策略——不澄清，继续生成（避免卡死）
+        return {"need_more_info": False, "questions": [], "notes": "llm_output_unparseable"}
+
+    need_more = bool(parsed.get("need_more_info", False))
+    questions = parsed.get("questions") or []
+    if not isinstance(questions, list):
+        questions = []
+    notes = str(parsed.get("notes") or "")
+
+    # 规范化 questions
+    norm_qs: List[Dict[str, Any]] = []
+    for q in questions[:5]:
+        if not isinstance(q, dict):
+            continue
+        key = str(q.get("key") or "").strip()
+        question = str(q.get("question") or "").strip()
+        qtype = str(q.get("type") or "text").strip()
+        if not key or not question:
+            continue
+        if qtype not in ("text", "choice", "json"):
+            qtype = "text"
+        item: Dict[str, Any] = {"key": key, "question": question, "type": qtype}
+        if qtype == "choice":
+            choices = q.get("choices") or []
+            if isinstance(choices, list):
+                item["choices"] = [str(x) for x in choices if str(x).strip()]
+        norm_qs.append(item)
+
+    if not need_more:
+        norm_qs = []
+
+    out = {"need_more_info": need_more, "questions": norm_qs, "notes": notes}
+    if debug:
+        _dbg(debug, f"[designer][clarify] decision={_safe_json(out, 2000)}")
+    return out
+
+
+# -------------------------
+# 2) generate experiments (LLM)
+# -------------------------
+
 async def gen_experiments(
+    *,
     user_intent: str,
     run_id: str,
     debug: bool,
+    state: Dict[str, Any],
     memories: List[Dict[str, Any]] | None = None,
 ) -> List[ExperimentSpec]:
     """
-    使用 LLM 根据 user_intent 生成实验设计（List[ExperimentSpec]）。
-    - memories：由外部检索得到的历史记忆（accept/edit/reject），用于给 LLM 提示避免重复错误。
+    使用 LLM 根据 user_intent + (messages/clarify_answers/失败&拒绝证据/历史记忆) 生成实验设计。
     """
+
     base_out = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "data", "runs", run_id)
     )
@@ -46,22 +221,22 @@ async def gen_experiments(
     llm = get_llm_for_agent("designer")
     system_prompt = designer_prompt
 
+    # 你的样例 config（用于约束可 patch 的 key 空间）
     SAMPLES_DIR = os.path.join(os.path.dirname(__file__), "..", "configs", "samples")
     sample_model = read_json(os.path.join(SAMPLES_DIR, "model.json"))
     sample_run = read_json(os.path.join(SAMPLES_DIR, "run.json"))
     sample_hw = read_json(os.path.join(SAMPLES_DIR, "hw.json"))
 
-    # memories 只压缩关键字段（避免 prompt 膨胀）
+    # 压缩 memories
     memories_compact: List[Dict[str, Any]] = []
-    if memories:
-        for m in memories[:5]:
-            memories_compact.append(
-                {
-                    "memory": m.get("memory"),
-                    "metadata": m.get("metadata", {}),
-                    "created_at": m.get("created_at"),
-                }
-            )
+    for m in (memories or [])[:5]:
+        memories_compact.append(
+            {
+                "memory": m.get("memory"),
+                "metadata": m.get("metadata", {}),
+                "created_at": m.get("created_at"),
+            }
+        )
 
     llm_req: Dict[str, Any] = {
         "task": "design_experiments",
@@ -73,12 +248,16 @@ async def gen_experiments(
             "Do NOT include 'out_dir' in experiments; the caller will attach it.",
             "Do NOT reference files. Do NOT assume paths.",
             "Keep experiments count between 3 and 12 unless user explicitly asks otherwise.",
-            "If retrieved_memories show plans were rejected or edited, avoid repeating those incorrect patterns.",
+            "If retrieved_memories or last_rejection/last_failures show bad patterns, avoid repeating them.",
+            "Prefer simple sweep (1-2 knobs) + clear failure boundary probes.",
         ],
         "context": {
             "user_intent": user_intent,
+            "dialog_tail": _messages_tail(state, 20),
+            "clarify_answers": state.get("clarify_answers", {}) or {},
+            "last_rejection": state.get("last_rejection"),
+            "last_failures": state.get("last_failures"),
             "retrieved_memories": memories_compact,
-            "experiment_goal_hint": "Typical goal: control variables; sweep one or two knobs; detect failure boundary.",
             "allowed_patch_scopes": {
                 "model_patch": "model config overrides (dict)",
                 "run_patch": "runtime/training config overrides using dot-keys (dict)",
@@ -118,11 +297,10 @@ async def gen_experiments(
         _dbg(debug, f"[designer][llm] ainvoke failed: {e}")
         return _fallback_default()
 
-    # ---- parse JSON ----
-    try:
-        llm_json = json.loads(resp.content)
-    except Exception as e:
-        _dbg(debug, f"[designer][llm] bad json: {e}, content={resp.content[:300]}")
+    # ✅ robust JSON parse（兼容“JSON后面跟自然语言”）
+    llm_json = _extract_first_json_object(getattr(resp, "content", "") or "")
+    if not llm_json:
+        _dbg(debug, f"[designer][llm] bad json (cannot parse), content={getattr(resp, 'content', '')[:300]}")
         return _fallback_default()
 
     _dbg(debug, f"[designer][llm] raw={str(llm_json)[:800]}")
@@ -132,6 +310,7 @@ async def gen_experiments(
         _dbg(debug, "[designer][llm] 'experiments' missing or empty -> fallback")
         return _fallback_default()
 
+    # normalize + attach out_dir
     normalized: List[ExperimentSpec] = []
     seen_ids: set[str] = set()
 
@@ -152,7 +331,7 @@ async def gen_experiments(
         if not exp_id:
             exp_id = f"exp_{idx:02d}"
 
-        # exp_id 规范化：只保留安全字符（防止路径/奇怪字符）
+        # exp_id 规范化（安全字符）
         safe = []
         for ch in exp_id:
             if ch.isalnum() or ch in ("_", "-", "."):
@@ -173,7 +352,6 @@ async def gen_experiments(
             continue
 
         out_dir = os.path.join(base_out, exp_id)
-
         normalized.append(
             {
                 "exp_id": exp_id,
@@ -193,6 +371,10 @@ async def gen_experiments(
     return normalized
 
 
+# -------------------------
+# 3) designer node (async)
+# -------------------------
+
 def _split_results(results: List[ExamResult]) -> Tuple[List[ExamResult], List[ExamResult]]:
     succ, fail = [], []
     for r in results:
@@ -205,35 +387,46 @@ def _split_results(results: List[ExamResult]) -> Tuple[List[ExamResult], List[Ex
 
 async def designer_agent(state: GlobalState, config: RunnableConfig):
     """
-    designer_agent：
-    1) 设计实验（LLM）
-    2) HITL：先交给人审（need_human）
-    3) 人类确认后 dispatch_ready -> Send 分发 exam_worker
-    4) collect fan-in
+    受 ReAct 启发的“图状态驱动澄清子范式”：
+
+    stage init/design:
+      1) LLM判断是否需要澄清 -> need_user 则 END（交给 human_review_node interrupt）
+      2) 信息足够 -> 生成 experiments_plan -> stage=need_human
+
+    stage dispatch_ready:
+      人审通过 -> Send 分发 exam_worker (保持你原逻辑)
+
+    stage collect:
+      有失败 -> 写 last_failures + messages -> 回到 design（第一步）
+      全成功 -> stage=analyze（进入 analyst 节点）
     """
     debug = bool(state.get("debug", False))
-
     stage = state.get("stage", "init")
     retries = int(state.get("retries", 0) or 0)
     max_retries = int(state.get("max_retries", 1) or 1)
 
     _dbg(debug, f"[designer] enter stage={stage}, retries={retries}/{max_retries}")
 
-    # ------------------------------------------------------------------
-    # (1) init/design：生成实验，但先交给人审（不分发）
-    # ------------------------------------------------------------------
+    # -------------------------
+    # init/design: clarify or plan
+    # -------------------------
     if stage in ("init", "design"):
         run_id = state.get("run_id") or _make_run_id()
         user_intent = str(state.get("user_intent") or "").strip()
         if not user_intent:
             raise ValueError("user_intent invalid")
 
-        # ✅ 从 DI 取 mem_store，检索记忆（best-effort）
+        # 记录 intent 到 messages（幂等）
+        updates: Dict[str, Any] = {"run_id": run_id}
+        if not state.get("_intent_logged"):
+            updates["messages"] = [HumanMessage(content=user_intent)]
+            updates["_intent_logged"] = True
+
+        # mem0 retrieval (best-effort)
         memories: List[Dict[str, Any]] = []
         store = _get_mem_store(config)
         if store is not None:
             try:
-                # store.search_for_designer 大概率是同步的 → to_thread 防止阻塞 event loop
                 memories = await asyncio.to_thread(
                     store.search_for_designer,
                     state=dict(state),
@@ -244,20 +437,55 @@ async def designer_agent(state: GlobalState, config: RunnableConfig):
             except Exception as e:
                 _dbg(debug, f"[designer][mem0] search failed: {e}")
 
-        experiments = await gen_experiments(user_intent, run_id, debug, memories=memories)
+        llm = get_llm_for_agent("designer")
 
-        _dbg(debug, f"[designer] planned {len(experiments)} experiments; wait human review")
+        # 1) clarify decision
+        clarify = await _llm_need_clarify(
+            llm=llm,
+            system_prompt=designer_prompt,
+            user_intent=user_intent,
+            state=dict(state),
+            memories=memories,
+            debug=debug,
+        )
 
-        return {
-            "stage": "need_human",
-            "run_id": run_id,
-            "user_intent": user_intent,
-            "experiments_plan": experiments,
-        }
+        if clarify.get("need_more_info"):
+            questions = clarify.get("questions") or []
+            updates["stage"] = "await_user"
+            updates["clarify_questions"] = questions
+            updates["clarify_notes"] = clarify.get("notes", "")
 
-    # ------------------------------------------------------------------
-    # (2) dispatch_ready：人类确认后，才执行 Send 分发逻辑
-    # ------------------------------------------------------------------
+            # ✅ 把提问写入 messages（依赖 add_messages reducer 追加）
+            q_text = "\n".join([f"- ({q.get('key')}) {q.get('question')}" for q in questions if isinstance(q, dict)])
+            updates["messages"] = updates.get("messages", []) + [
+                AIMessage(content=f"[CLARIFY] Need more info:\n{q_text}")
+            ]
+
+            # ✅ 关键：END 时也要把 updates 全写回
+            return Command(goto=END, update=updates)
+
+        # 2) enough info -> generate plan
+        experiments = await gen_experiments(
+            user_intent=user_intent,
+            run_id=run_id,
+            debug=debug,
+            state=dict(state),
+            memories=memories,
+        )
+
+        updates.update(
+            {
+                "stage": "need_human",
+                "run_id": run_id,
+                "experiments_plan": experiments,
+                "messages": [AIMessage(content=f"[PLAN] generated {len(experiments)} experiments; awaiting human review")],
+            }
+        )
+        return updates
+
+    # -------------------------
+    # dispatch_ready: fan-out
+    # -------------------------
     if stage == "dispatch_ready":
         run_id = state.get("run_id") or _make_run_id()
         user_intent = str(state.get("user_intent") or "").strip()
@@ -268,42 +496,34 @@ async def designer_agent(state: GlobalState, config: RunnableConfig):
         if not isinstance(experiments, list) or not experiments:
             raise ValueError("experiments invalid: nothing to dispatch")
 
-        from langgraph.types import Send  # noqa
-
-        sends = []
-        for exp in experiments:
-            sends.append(
-                Send(
-                    "exam_worker",
-                    {
-                        "current_experiment": exp,
-                        "debug": debug,
-                        "run_id": run_id,
-                    },
-                )
+        sends = [
+            Send(
+                "exam_worker",
+                {"current_experiment": exp, "debug": debug, "run_id": run_id},
             )
+            for exp in experiments
+        ]
 
         _dbg(debug, f"[designer] dispatch {len(sends)} exam_worker jobs (human approved)")
-
-        from langgraph.types import Command
 
         return Command(
             update={
                 "stage": "collect",
                 "run_id": run_id,
                 "user_intent": user_intent,
-                "experiments": experiments,
+                "experiments": experiments,  # 固化已批准
                 "pending": len(experiments),
                 "exam_results": [],
                 "failed_results": [],
                 "success_results": [],
+                "messages": [AIMessage(content=f"[DISPATCH] {len(experiments)} workers launched")],
             },
             goto=sends,
         )
 
-    # ------------------------------------------------------------------
-    # (3) collect：fan-in 聚合
-    # ------------------------------------------------------------------
+    # -------------------------
+    # collect: fan-in
+    # -------------------------
     if stage == "collect":
         pending = int(state.get("pending", 0) or 0)
         results = state.get("exam_results", []) or []
@@ -316,78 +536,58 @@ async def designer_agent(state: GlobalState, config: RunnableConfig):
         succ, fail = _split_results(results2)
         _dbg(debug, f"[designer] collected results: success={len(succ)}, fail={len(fail)}")
 
+        # 4) 有失败 -> 回到第一步（design），把失败摘要写入 messages + last_failures
         if fail:
-            if retries < max_retries:
-                _dbg(debug, "[designer] retry enabled -> redesign failed exps and re-dispatch")
+            fail_brief = {
+                "failed_count": len(fail),
+                "failed": [
+                    {
+                        "exp_id": x.get("exp_id"),
+                        "reason": x.get("reason"),
+                        "message": x.get("message"),
+                    }
+                    for x in fail[:8]
+                ],
+            }
+            # 如果想限制重试：用 retries/max_retries 控制（可选）
+            if retries >= max_retries:
+                return {
+                    "stage": "need_redesign",
+                    "failed_results": fail,
+                    "success_results": succ,
+                    "last_failures": fail_brief,
+                    "messages": [AIMessage(content=f"[WORKER_FAIL] retries exhausted: {_safe_json(fail_brief, 2000)}")],
+                }
 
-                new_exps: List[ExperimentSpec] = []
-                for r in fail:
-                    exp_id = r["exp_id"]
-                    orig = next(
-                        (e for e in (state.get("experiments", []) or []) if e.get("exp_id") == exp_id),
-                        None,
-                    )
-                    if not orig:
-                        continue
-                    patched = dict(orig)
-                    patched["exp_id"] = exp_id + "_retry"
-                    patched["description"] = (orig.get("description", "") + " (retry)")
-                    patched_run_patch = dict(orig.get("run_patch", {}))
-                    patched_run_patch["train.global_batch_size"] = 768
-                    patched["run_patch"] = patched_run_patch
-
-                    base_out = os.path.abspath(
-                        os.path.join(os.path.dirname(__file__), "..", "data", "runs", state["run_id"])
-                    )
-                    patched["out_dir"] = os.path.join(base_out, patched["exp_id"])
-                    new_exps.append(patched)  # type: ignore
-
-                from langgraph.types import Send, Command  # noqa
-
-                sends = [
-                    Send(
-                        "exam_worker",
-                        {"current_experiment": exp, "debug": debug, "run_id": state["run_id"]},
-                    )
-                    for exp in new_exps
-                ]
-
-                return Command(
-                    update={
-                        "stage": "collect",
-                        "retries": retries + 1,
-                        "failed_results": fail,
-                        "success_results": succ,
-                        "experiments": (state.get("experiments", []) or []) + new_exps,
-                        "pending": len(new_exps),
-                    },
-                    goto=sends,
-                )
-
-            _dbg(debug, "[designer] retries exhausted -> need_redesign")
             return {
-                "stage": "need_redesign",
+                "stage": "design",
+                "retries": retries + 1,
                 "failed_results": fail,
                 "success_results": succ,
+                "last_failures": fail_brief,
+                "messages": [AIMessage(content=f"[WORKER_FAIL] back to clarify/design: {_safe_json(fail_brief, 2000)}")],
             }
 
+        # 全部成功：进入 analyst
         return {
             "stage": "analyze",
             "failed_results": [],
             "success_results": succ,
+            "messages": [AIMessage(content="[COLLECT_OK] all experiments succeeded -> analyze")],
         }
 
-    # ------------------------------------------------------------------
-    # (4) need_redesign：兜底
-    # ------------------------------------------------------------------
+    # -------------------------
+    # need_redesign: 兜底
+    # -------------------------
     if stage == "need_redesign":
         return {
             "stage": "done",
             "analyst_report": {
                 "ok": False,
-                "message": "Experiments failed and retries exhausted; please confirm variable fields / constraints.",
+                "message": "Experiments failed and retries exhausted; please clarify constraints and redesign.",
                 "anomalies": [{"reason": "designer_need_more_info"}],
             },
+            "messages": [AIMessage(content="[DONE] need_redesign")],
         }
 
     return {"stage": "done"}

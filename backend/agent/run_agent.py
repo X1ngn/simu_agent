@@ -3,11 +3,11 @@ from __future__ import annotations
 import os
 import json
 import asyncio
-
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Literal, Callable
+from typing import Any, Dict, Optional, Literal, Callable, List
 
 from langgraph.types import Command
+from langchain_core.messages import HumanMessage, AIMessage
 
 from backend.agent.memory import Mem0MilvusMemoryStore
 from backend.agent.graph import build_graph
@@ -28,7 +28,7 @@ class HitlDecision:
 def _safe_get_experiments_from_payload(payload: Dict[str, Any]) -> Any:
     """
     payload 可能是 {"experiments_plan": ...} 或 {"value": {...}}
-    你的 human_review_node 传的是 experiments_plan(list)，所以这里返回 Any 更稳。
+    human_review_node 通常传 experiments_plan(list)；这里返回 Any 更稳。
     """
     if "experiments_plan" in payload:
         return payload["experiments_plan"]
@@ -58,9 +58,6 @@ def _extract_interrupt_payload(state: Dict[str, Any]) -> Optional[Dict[str, Any]
 
 
 def _default_cli_decider(payload: Dict[str, Any], state: Dict[str, Any]) -> HitlDecision:
-    """
-    CLI 交互版决策器（后续你改成 API：直接替换这个函数即可）。
-    """
     print("\n=== HITL: Human Review Required ===")
     try:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -93,32 +90,19 @@ async def handle_hitl_interrupts_async(
     decider: Optional[Callable[[Dict[str, Any], Dict[str, Any]], HitlDecision]] = None,
 ) -> Dict[str, Any]:
     """
-    ✅ Async 版 HITL 处理器：处理所有 interrupt，直到图不再暂停为止。
-
-    关键修复点：
-    - 图里存在 async 节点（如 designer_agent async）后，resume 必须使用 app.ainvoke
-    - 不能再用 app.invoke，也不能用 to_thread 包 app.invoke
-
-    三种动作：
-      - accept：resume {"action":"accept"} -> human_review_node 设置 stage=dispatch_ready -> 回 designer 分发
-      - edit：resume {"action":"edit","experiments":...} -> human_review_node 同样走 dispatch_ready（你的逻辑里 accept/edit 都 dispatch_ready）
-      - reject：resume {"action":"reject"} -> human_review_node 走 done（你的逻辑里 else -> done）
+    Async 版 HITL 处理器：处理所有 interrupt，直到图不再暂停为止。
     """
     decider = decider or _default_cli_decider
 
     while True:
         payload = _extract_interrupt_payload(state)
         if payload is None:
-            return state  # 没有中断，正常结束
+            return state
 
         decision = decider(payload, state)
 
         if decision.action == "reject":
-            # 直接退出/或者继续推进到 done（取决于你 human_review_node 如何处理 reject）
-            resume_value = {
-                "action": "reject",
-                "feedback": "user reject design; run aborted",
-            }
+            resume_value = {"action": "reject", "feedback": "user reject design; run aborted"}
             state = await app.ainvoke(Command(resume=resume_value), config=config)
             continue
 
@@ -132,7 +116,6 @@ async def handle_hitl_interrupts_async(
             experiments = _safe_get_experiments_from_payload(payload)
 
             if edited_text:
-                # 允许用户直接粘贴 JSON 覆盖 experiments
                 try:
                     experiments = json.loads(edited_text)
                 except json.JSONDecodeError:
@@ -148,8 +131,89 @@ async def handle_hitl_interrupts_async(
 
 
 # =========================
-# 原 main 主流程（最小改动）
+# CLI 澄清循环（await_user）
 # =========================
+
+def _get_last_ai_message_text(state: Dict[str, Any]) -> str:
+    """
+    尽量从 state["messages"] 中找最后一条 AIMessage。
+    如果没有 messages，就兜底打印 clarify_questions。
+    """
+    msgs = state.get("messages")
+    if isinstance(msgs, list):
+        for m in reversed(msgs):
+            if isinstance(m, AIMessage):
+                return str(m.content or "")
+            # 有些框架会把 message 序列化成 dict
+            if isinstance(m, dict) and m.get("type") == "ai":
+                return str(m.get("content") or "")
+    # fallback: clarify_questions
+    qs = state.get("clarify_questions")
+    if isinstance(qs, list) and qs:
+        lines = []
+        for q in qs:
+            if isinstance(q, dict):
+                lines.append(f"- ({q.get('key')}) {q.get('question')}")
+        if lines:
+            return "[CLARIFY]\n" + "\n".join(lines)
+    return "[CLARIFY] 需要补充信息，但未找到具体问题列表。"
+
+
+def _append_user_message(state: Dict[str, Any], text: str) -> None:
+    """
+    把用户补充信息写入 messages，配合 add_messages reducer。
+    没有 messages 字段时也兜底能跑。
+    """
+    if not text.strip():
+        return
+    msg = HumanMessage(content=text.strip())
+    if "messages" in state and isinstance(state["messages"], list):
+        state["messages"] = state["messages"] + [msg]  # 让 reducer 合并更自然
+    else:
+        state["messages"] = [msg]
+
+
+async def _clarify_loop_if_needed(app: Any, state: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    如果 stage == await_user：打印问题，收集用户输入，写回 state，然后继续 ainvoke。
+    注意：这里不使用 interrupt/resume，而是“下一轮用户输入后再跑一轮图”。
+    """
+    while state.get("stage") == "await_user":
+        print("\n=== CLARIFICATION REQUIRED ===")
+        print(_get_last_ai_message_text(state))
+
+        print("\n请补充信息（可多行输入，空行结束）：")
+        lines: List[str] = []
+        while True:
+            line = input("> ")
+            if line.strip() == "":
+                break
+            lines.append(line)
+        user_reply = "\n".join(lines).strip()
+
+        if not user_reply:
+            print("你没有输入任何补充信息，将保持 await_user（你可以按 Ctrl+C 退出）。")
+            continue
+
+        # 写回 messages（让 designer 下次能看到上下文）
+        _append_user_message(state, user_reply)
+
+        # 关键：把 stage 拉回 design，让 designer 再跑一次 clarify+design
+        state["stage"] = "design"
+
+        # 再推进一轮图
+        state = await app.ainvoke(state, config=config)
+
+        # 推进后如果又触发 human_review interrupt，也顺便处理掉
+        state = await handle_hitl_interrupts_async(app, state, config=config)
+
+    return state
+
+
+# =========================
+# main 主流程
+# =========================
+
 async def amain() -> None:
     debug = True
     user_intent = "固定模型与硬件，扫 global_batch_size 对吞吐与显存峰值的影响，并找出失败边界。"
@@ -162,6 +226,8 @@ async def amain() -> None:
         "user_intent": user_intent,
         "retries": 0,
         "max_retries": 1,
+        # ✅ 建议把用户初始意图也放进 messages，便于 clarify LLM 看上下文
+        "messages": [HumanMessage(content=user_intent)],
     }
 
     mem_store = Mem0MilvusMemoryStore()
@@ -173,17 +239,21 @@ async def amain() -> None:
         }
     }
 
-    # ✅ 全程 async 推进
-    final_state = await app.ainvoke(init_state, config=config)
+    # 1) 先跑一轮
+    state = await app.ainvoke(init_state, config=config)
 
-    # ✅ HITL：改为 async 版本，不再 to_thread
-    final_state = await handle_hitl_interrupts_async(app, final_state, config=config)
+    # 2) 若触发 human_review interrupt，先处理
+    state = await handle_hitl_interrupts_async(app, state, config=config)
+
+    # 3) 若需要澄清（await_user），进入 CLI 澄清循环
+    state = await _clarify_loop_if_needed(app, state, config=config)
 
     print("\n=== FINAL REPORT ===")
-    report = final_state.get("analyst_report", {}) or {}
+    report = state.get("analyst_report", {}) or {}
     if not report:
         print("ok: False")
-        print("message: user rejected the experiment design; run aborted")
+        print("message: run finished without analyst_report (possibly rejected or awaiting more input)")
+        print("stage:", state.get("stage"))
     else:
         for k, v in report.items():
             print(f"{k}: {v}")

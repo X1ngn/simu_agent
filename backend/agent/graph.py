@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from typing import Optional, Sequence
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
-
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from backend.agent.state import GlobalState
 from backend.agent.agents.designer import designer_agent
@@ -14,29 +15,30 @@ from backend.agent.agents.human_review import human_review_node
 def _route_after_designer(state: GlobalState) -> str:
     stage = state.get("stage", "init")
 
-    # ✅ 设计：designer 先产出“待确认的方案”，进入 need_human
-    # 人类确认后再回到 designer，把 stage 推到 dispatch（此时 designer 才 Send 分发 worker）
+    # ✅ 关键：等待用户补充信息时，直接停
+    if stage == "await_user":
+        return END
+
     if stage == "need_human":
         return "human_review"
 
-    # dispatch 这一轮 designer 已经用 Command(goto=[Send...]) 把 worker 发出去了
-    # 不要立刻再次运行 designer，等待 worker -> designer 触发 fan-in
-    if stage == "dispatch":
-        return END
-
+    # 你注释写的是 dispatch，但你系统里实际用的是 dispatch_ready / collect
+    # 这里只保留 done/分析的终止逻辑即可
     if stage == "analyze":
         return "analyst"
 
     if stage == "done":
         return END
 
-    # worker 返回时会把 stage 推到 collect
+    # worker fan-in：exam_worker -> designer
     if stage == "collect":
         return "designer"
 
+    # 需要重设计：回 designer
     if stage == "need_redesign":
         return "designer"
 
+    # 默认继续走 designer（init/design/dispatch_ready 都会落到这里）
     return "designer"
 
 
@@ -45,16 +47,11 @@ def _route_after_analyst(state: GlobalState) -> str:
     ok = bool(report.get("ok", False))
     if ok:
         return END
-    # analyst 发现异常，回 designer 决策是否重跑/重设实验
-    return "need_redesign"
 
+    # ✅ analyst 发现异常，回 designer 走重设计流程
+    # 这里直接回 designer，并由 update 把 stage 设置为 need_redesign（在 analyst_agent 或这里都行）
+    return "designer"
 
-
-
-
-# backend/agent/graph.py
-from typing import Optional, Sequence
-from langgraph.checkpoint.base import BaseCheckpointSaver
 
 def build_graph(
     designer=designer_agent,
@@ -62,7 +59,7 @@ def build_graph(
     worker=exam_worker,
     analyst=analyst_agent,
     checkpointer: Optional[BaseCheckpointSaver] = None,
-    interrupt_before: Optional[Sequence[str]] = None,   # ✅ 新增
+    interrupt_before: Optional[Sequence[str]] = None,
 ):
     g = StateGraph(GlobalState)
 
@@ -83,7 +80,5 @@ def build_graph(
 
     return g.compile(
         checkpointer=checkpointer,
-        interrupt_before=interrupt_before,   # ✅ 透传
+        interrupt_before=interrupt_before,
     )
-
-
