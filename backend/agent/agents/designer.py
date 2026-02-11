@@ -16,11 +16,14 @@ from backend.agent.tools.json_io import read_json
 from backend.agent.llm_factory import get_llm_for_agent
 from backend.agent.prompts.designer import designer_prompt
 from backend.agent.memory import _get_mem_store
+from backend.agent.context_budget.compressor import maybe_truncate_and_summarize
+from backend.agent.context_budget.logger_sqlite import SQLiteCompressionLogger
 
 
 # -------------------------
 # utils
 # -------------------------
+_COMPRESS_LOGGER = SQLiteCompressionLogger(db_path=os.path.join(os.path.dirname(__file__), "..", "data", "compression_logs.sqlite3"))
 
 def _dbg(debug: bool, msg: str) -> None:
     if debug:
@@ -200,6 +203,15 @@ async def _llm_need_clarify(
             }
         )
 
+    # 在 llm_req 构造之前插入：
+    maybe_truncate_and_summarize(
+        state=state,
+        logger=_COMPRESS_LOGGER,
+        max_tokens=16000,  # 按你的模型上下文来
+        reserve_tokens=1500,
+        keep_last_n=20,
+    )
+
     llm_req: Dict[str, Any] = {
         "task": "clarify_user_intent_for_experiment_design",
         "rules": [
@@ -311,6 +323,15 @@ async def gen_experiments(
                 "created_at": m.get("created_at"),
             }
         )
+
+    # 在 llm_req 构造之前插入：
+    maybe_truncate_and_summarize(
+        state=state,
+        logger=_COMPRESS_LOGGER,
+        max_tokens=16000,  # 按你的模型上下文来
+        reserve_tokens=1500,
+        keep_last_n=20,
+    )
 
     llm_req: Dict[str, Any] = {
         "task": "design_experiments",

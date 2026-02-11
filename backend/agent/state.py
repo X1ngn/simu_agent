@@ -89,6 +89,9 @@ class GlobalState(TypedDict, total=False):
     last_rejection: Dict[str, Any]
     last_failures: Dict[str, Any]
 
+    # ✅ rolling structured summary used when dialog is truncated
+    rolling_summary: Dict[str, Any]
+
     _intent_logged: bool
 
     # designer output
