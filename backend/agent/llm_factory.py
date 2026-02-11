@@ -8,9 +8,15 @@ from .config import ProviderConfig, get_api_key
 from .chat_adapters import LLMAsChatModel
 
 from pathlib import Path
-from langchain_core.language_models.chat_models import BaseChatModel
 
 from backend.agent.config import load_app_config  # 你放哪都行
+
+# ✅ token usage callback（可选）
+try:
+    from backend.agent.llm_usage import TokenUsageCallback  # type: ignore
+except Exception:  # noqa: BLE001
+    TokenUsageCallback = None  # type: ignore
+
 
 def create_chat_model(cfg: ProviderConfig) -> BaseChatModel:
     if cfg.kind == "openai":
@@ -65,8 +71,27 @@ def create_chat_model(cfg: ProviderConfig) -> BaseChatModel:
 
 _LLM_CACHE: dict[str, BaseChatModel] = {}
 
+
 def build_agent_llms(providers: Dict[str, ProviderConfig]) -> Dict[str, BaseChatModel]:
     return {name: create_chat_model(cfg) for name, cfg in providers.items()}
+
+
+def _attach_usage_callback(llm: BaseChatModel, agent_name: str) -> BaseChatModel:
+    """
+    给 LLM 绑定默认 callbacks（无需每次 invoke/ainvoke 传 callbacks）。
+    - 使用 Runnable.with_config 合并默认 config
+    - 若 llm_usage 未安装/导入失败，则原样返回
+    """
+    if TokenUsageCallback is None:
+        return llm
+
+    try:
+        cb = TokenUsageCallback(label=agent_name)  # type: ignore
+        # ✅ 关键：给这个 runnable 增加默认 callbacks
+        return llm.with_config({"callbacks": [cb]})
+    except Exception:
+        # 不要让统计影响主流程
+        return llm
 
 
 def get_llm_for_agent(agent_name: str) -> BaseChatModel:
@@ -86,13 +111,8 @@ def get_llm_for_agent(agent_name: str) -> BaseChatModel:
 
     llm = create_chat_model(provider_cfg)
 
+    # ✅ 绑定 token usage callback（默认启用）
+    llm = _attach_usage_callback(llm, agent_name)
+
     _LLM_CACHE[agent_name] = llm
     return llm
-
-
-# def get_system_prompt(agent_name: str) -> str:
-#     llm_cfg_path = Path(__file__).resolve().parents[2] / "backend" / "agent" / "configs" / "llm_config.yaml"
-#     agent_cfg_path = Path(__file__).resolve().parents[2] / "backend" / "agent" / "configs" / "agent_config.yaml"
-#     app_cfg = load_app_config(str(llm_cfg_path), str(agent_cfg_path))
-#
-#     return app_cfg.agents[agent_name].system_prompt
