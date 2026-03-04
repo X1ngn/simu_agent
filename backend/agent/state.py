@@ -8,28 +8,13 @@ from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage
 
 
-Stage = Literal[
-    "init",
-    "design",
-    "dispatch",
-    "collect",
-    "analyze",
-    "done",
-    "need_redesign",
-    "await_user",
-]
-
-
 class ExperimentSpec(TypedDict):
     """designer 规划出的单个仿真任务"""
     exp_id: str
     description: str
-    # 对三个样例配置分别做 patch（点路径/JSONPath 简化为 dot-path）
     model_patch: Dict[str, Any]
     run_patch: Dict[str, Any]
     hw_patch: Dict[str, Any]
-    # 输出目录（exam_worker 会在这里写 json 与 csv）
-    out_dir: str
 
 
 class ExamResult(TypedDict, total=False):
@@ -51,62 +36,34 @@ class AnalystReport(TypedDict, total=False):
     message: str
 
 
-Stage = Literal[
-    "init",
-    "design",
-    "need_user",
-    "need_human",
-    "dispatch_ready",
-    "collect",
-    "need_redesign",
-    "analyze",
-    "done",
-]
-
-class ClarifyQuestion(TypedDict, total=False):
-    key: str
-    question: str
-    type: Literal["text", "choice", "json"]
-    choices: List[str]
-
-class GlobalState(TypedDict, total=False):
-    # user intent
-    user_intent: str
-
-    # runtime
-    debug: bool
-    stage: Stage
-    run_id: str
-
-    # ✅ 对话上下文（用于 clarify / redesign / 失败归因）
+class AgentState(TypedDict, total=False):
+    # 对话历史（核心，tool calling 的消息链全在这里）
     messages: Annotated[List[BaseMessage], add_messages]
 
-    # ✅ 澄清子范式的结构化槽位（避免把 key/value 全塞进自然语言）
-    clarify_questions: List[ClarifyQuestion]
-    clarify_answers: Dict[str, Any]
+    # 业务数据
+    user_intent: str
+    run_id: str
+    debug: bool
 
-    # ✅ 让“reject / fail -> 回到第一步”可追踪
-    last_rejection: Dict[str, Any]
-    last_failures: Dict[str, Any]
-
-    # ✅ rolling structured summary used when dialog is truncated
-    rolling_summary: Dict[str, Any]
-
-    _intent_logged: bool
-
-    # designer output
+    # plan_agent 输出
     experiments_plan: List[ExperimentSpec]
+
+    # human_review 输出
+    human_approved: bool
+
+    # exec_agent 产生的结果
     experiments: List[ExperimentSpec]
+    exam_results: List[ExamResult]
 
-    # exam aggregation (map-reduce)
-    pending: Annotated[int, operator.add]
-    exam_results: Annotated[List[ExamResult], operator.add]
-    failed_results: List[ExamResult]
-    success_results: List[ExamResult]
-
-    # analyst output
+    # 最终报告
     analyst_report: AnalystReport
 
-    # control
-    retries: int
-    max_retries: int
+    # 长期记忆
+    rolling_summary: Dict[str, Any]
+
+    # 控制
+    finished: bool
+
+
+# Keep GlobalState as alias for backward compatibility during transition
+GlobalState = AgentState

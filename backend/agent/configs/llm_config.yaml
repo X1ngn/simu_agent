@@ -1,7 +1,7 @@
 llm_providers:
   openai_default:
     kind: openai
-    model: qwen-max
+    model: qwen3.5-27b
     temperature: 0.2
     max_tokens: 1024
     base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
